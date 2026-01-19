@@ -37,15 +37,12 @@ auto timer_ntp = timer_create_default(); // 20230808 ntp 時間功能
 auto timer_manual_pump = timer_create_default(); // manual pump auto-stop
 auto timer_events = timer_create_default(); // SSE debounce / pacing
 auto timer_heap = timer_create_default(); // heap monitoring
+
 Timer<>::Task statusPushTask;
 unsigned long lastStatusSentMs = 0;
 const unsigned long STATUS_DEBOUNCE_MS = 1000; // max 1 push per second
 bool statusPushScheduled = false;
 void set_timer_blink_interval_to(int interval);
-void scheduleNtpFast();
-void scheduleNtpSlow();
-bool ntpFastPoll(void *);
-bool ntpSlowPoll(void *);
 const int normal_blink_interval = 1000; // ms // when normal -> waiting & pump is on
 const int overheated_blink_interval = 250; // ms // when over heat protecting
 const int badconnmode_blink_interval = 50; // ms // when "no conn mode" active
@@ -54,7 +51,7 @@ const int timer_2_interval = 20 * 60 * 1000; // ms // 多久時間後啟動過�
 const int timer_3_interval = 10 * 60 * 1000; // ms // 過熱保護的停機散熱時間
 const int relay_open_interval = 300; // 控制遙控器點擊的停留時間
 const int timer_bad_connection_delay = 1 * 60 * 1000; // ms // how long till enter "no conn mode"
-const int timer_ntp_interval = 1 * 60 * 1000; // 20230808 ntp 時間功能 // 檢查是否在pre_fill_up的時間範圍內
+const int timer_heapcheck_interval = 60 * 60 * 1000; // ms // heap monitoring interval
 const long manual_pump_duration_ms = 5 * 60 * 1000; // manual run duration
 float MAX_WATER_LEVEL = 120; // 實測最大值 83 // 2023111月底外部最大壓力測試 122
 float MIN_WATER_LEVEL = 70; // 實測最小值 46
@@ -1144,8 +1141,8 @@ void setup() {
   pinMode(GPIO4STOP, OUTPUT); //stop
   digitalWrite(GPIO4STOP, HIGH);
 
-  String myip = "192.168.1.218";
-  IPAddress staticIP(192, 168, 1, 218);
+  String myip = "192.168.1.217";
+  IPAddress staticIP(192, 168, 1, 217);
   IPAddress gateway(192, 168, 1, 200);
   IPAddress subnet(255, 255, 255, 0);
   WiFi.config(staticIP, gateway, subnet);
@@ -1282,7 +1279,7 @@ void setup() {
   server.begin();
 
   timer_ntp.every(timer_ntp_interval, isTimeInRange); // Pre-fill check every 1 min
-  timer_heap.every(60 * 60 * 1000, heapCheck); // Heap monitoring every hour
+  timer_heap.every(timer_heapcheck_interval, heapCheck); // Heap monitoring every hour
   set_timer_blink_interval_to(normal_blink_interval);
   // timer_1.in(timer_1_delay, fill_up); // Auto pump start after boot (31 sec) [disabled]
   reset_bad_conn_timer(); // timer_bad_connection
