@@ -6,7 +6,7 @@
 #define WDT_TIMEOUT 30
 #define WOOOOOOOOOF 18 // must smaller then WDT_TIMEOUT
 int last = 0;
-bool stop_wdt = false; // set to true to reset devices
+bool stop_wdt = false; // set to true to reset devicesser
 #include <Arduino.h>
 #ifdef ESP32
 #include <WiFi.h>
@@ -21,6 +21,8 @@ const char *PARAM_INPUT_WATERLEVEL = "message"; //test
 const char *PARAM_INPUT_FRONTDOOR = "frontdoor";
 const char *PARAM_INPUT_SETMAXLEVEL = "setmaxlevel";
 const char *PARAM_INPUT_SETMINLEVEL = "setminlevel";
+const char *PARAM_INPUT_MANUALPUMP = "manualpump";
+const char *PARAM_INPUT_MANUALPUMPSTOP = "manualpumpstop";
 String message = "null";
 #include <arduino-timer.h>
 auto timer_blink = timer_create_default();
@@ -30,6 +32,12 @@ auto timer_3 = timer_create_default(); // 過熱保護復歸
 auto timer_relay = timer_create_default(); // 鐵門 frontdoor relay
 auto timer_bad_connection = timer_create_default(); // how long till enter "no conn mode"
 auto timer_ntp = timer_create_default(); // 20230808 ntp 時間功能
+auto timer_manual_pump = timer_create_default(); // manual pump auto-stop
+void set_timer_blink_interval_to(int interval);
+void scheduleNtpFast();
+void scheduleNtpSlow();
+bool ntpFastPoll(void *);
+bool ntpSlowPoll(void *);
 const int normal_blink_interval = 1000; // ms // when normal -> waiting & pump is on
 const int overheated_blink_interval = 250; // ms // when over heat protecting
 const int badconnmode_blink_interval = 50; // ms // when "no conn mode" active
@@ -39,6 +47,7 @@ const int timer_3_interval = 10 * 60 * 1000; // ms // 過熱保護的停機散�
 const int relay_open_interval = 300; // 控制遙控器點擊的停留時間
 const int timer_bad_connection_delay = 1 * 60 * 1000; // ms // how long till enter "no conn mode"
 const int timer_ntp_interval = 10 * 60 * 1000; // 20230808 ntp 時間功能 // 檢查是否在pre_fill_up的時間範圍內
+const long manual_pump_duration_ms = 5 * 60 * 1000; // manual run duration
 float MAX_WATER_LEVEL = 120; // 實測最大值 83 // 2023111月底外部最大壓力測試 122
 float MIN_WATER_LEVEL = 70; // 實測最小值 46
 float DEFICIENT_WATER_LEVEL = 70; // 預先補水啟動補水之水位 // Deficient // Insufficient
@@ -61,16 +70,157 @@ enum pumpStatus {
 typedef enum pumpStatus PumpStatus;
 PumpStatus pump_status = STOPPED; // 初始化為已停止狀態
 long ms = 0;
+
 // 20230808 ntp 時間功能
-#include <NTPClient.h>
+// #include <NTPClient.h>
 #include <WiFiUdp.h>
+#include <NTPClient.h> // restore include to define NTPClient
 WiFiUDP ntpUDP;
-NTPClient timeClient(ntpUDP, "pool.ntp.org");
+const char* ntpServers[] = {
+  "pool.ntp.org",
+  "time.nist.gov",
+  "time.google.com",
+  "time.windows.com"
+};
+NTPClient timeClient(ntpUDP, "time.nist.gov");
+int currentNtpServerIndex = 0;
+String lastTimeServer = "";
+unsigned long lastTimeSyncMs = 0;
+unsigned long lastTimeEpoch = 0;
+unsigned long lastCommandMs = 0;
+String lastCommand = "none";
+bool hasTimeSync = false;
+int ntpAttemptIndex = 0;
+Timer<>::Task ntpTask;
+// Fallback direct IPs to avoid DNS issues
+const char* ntpServersIpFallback[] = {
+  "129.6.15.28",   // time-a-g.nist.gov
+  "216.239.35.0",  // time.google.com (one of the anycast IPs)
+  "133.243.238.244" // ntp.nict.jp (Japan NICT)
+};
+
+// === LOG SYSTEM ===
+// Memory calculation for ESP32:
+// - ESP32 has ~320KB RAM, WiFi/stack uses ~100-150KB
+// - Using fixed char[64] instead of String to avoid heap fragmentation
+// - Per entry: 4 (enum) + 4 (ms) + 4 (epoch) + 64 (action) = 76 bytes
+// - Safe allocation: ~5KB -> 64 entries (4,864 bytes total)
+enum LogLevel { LOG_ERROR = 0, LOG_WARNING = 1, LOG_VERBOSE = 2 };
+const int LOG_BUFFER_SIZE = 512;  // Safe size: 64 * 76 bytes = 4,864 bytes
+const int LOG_ACTION_SIZE = 64;  // Max chars per action message
+struct LogEntry {
+  LogLevel level;              // 4 bytes
+  unsigned long timestampMs;   // 4 bytes
+  unsigned long epochTime;     // 4 bytes
+  char action[LOG_ACTION_SIZE]; // 64 bytes (fixed, no heap fragmentation)
+};  // Total: 76 bytes per entry
+LogEntry logBuffer[LOG_BUFFER_SIZE];
+int logHead = 0;
+int logCount = 0;
+
+void addLog(LogLevel level, const String &action) {
+  LogEntry &entry = logBuffer[logHead];
+  entry.level = level;
+  entry.timestampMs = millis();
+  // Calculate epoch from cached time
+  if (lastTimeEpoch > 0 && lastTimeSyncMs > 0) {
+    entry.epochTime = lastTimeEpoch + ((entry.timestampMs - lastTimeSyncMs) / 1000);
+  } else {
+    entry.epochTime = 0;
+  }
+  // Copy action with truncation to fixed buffer
+  strncpy(entry.action, action.c_str(), LOG_ACTION_SIZE - 1);
+  entry.action[LOG_ACTION_SIZE - 1] = '\0';
+  logHead = (logHead + 1) % LOG_BUFFER_SIZE;
+  if (logCount < LOG_BUFFER_SIZE) logCount++;
+}
+
+void logError(const String &action) { addLog(LOG_ERROR, action); Serial.println("[ERROR] " + action); }
+void logWarning(const String &action) { addLog(LOG_WARNING, action); Serial.println("[WARN] " + action); }
+void logVerbose(const String &action) { addLog(LOG_VERBOSE, action); Serial.println("[VERBOSE] " + action); }
+
+void clearLogs() {
+  logHead = 0;
+  logCount = 0;
+}
+
+String getLogsJson() {
+  String json = "[";
+  json.reserve(LOG_BUFFER_SIZE * 100); // Pre-allocate to reduce fragmentation
+  int start = (logCount < LOG_BUFFER_SIZE) ? 0 : logHead;
+  bool first = true;
+  for (int i = 0; i < logCount; i++) {
+    int idx = (start + i) % LOG_BUFFER_SIZE;
+    LogEntry &e = logBuffer[idx];
+    if (!first) json += ",";
+    first = false;
+    String levelStr = (e.level == LOG_ERROR) ? "ERROR" : (e.level == LOG_WARNING) ? "WARNING" : "VERBOSE";
+    String timeStr = formatTimeFromEpoch(e.epochTime);
+    // Escape quotes in action
+    String escapedAction = String(e.action);
+    escapedAction.replace("\"", "'");
+    json += "{\"level\":\"" + levelStr + "\",";
+    json += "\"lv\":" + String(e.level) + ",";  // numeric level for filtering
+    json += "\"ms\":" + String(e.timestampMs) + ",";
+    json += "\"time\":\"" + timeStr + "\",";
+    json += "\"action\":\"" + escapedAction + "\"}";
+  }
+  json += "]";
+  return json;
+}
+// === END LOG SYSTEM ===
+
+bool syncTimeWithServer(const char* server, int attempts = 4, int delayMs = 2000) {
+  Serial.print("Trying NTP server: ");
+  Serial.println(server);
+
+  timeClient.end();
+  timeClient = NTPClient(ntpUDP, server, 28800, 60000);
+  timeClient.begin();
+
+  for (int retry = 0; retry < attempts; retry++) {
+    if (!stop_wdt) esp_task_wdt_reset();
+    if (timeClient.forceUpdate()) {
+      Serial.print("NTP sync successful via: ");
+      Serial.println(server);
+      Serial.print("Time: ");
+      Serial.println(timeClient.getFormattedTime());
+      lastTimeServer = server;
+      lastTimeSyncMs = millis();
+      lastTimeEpoch = timeClient.getEpochTime();
+      hasTimeSync = true;
+      logVerbose("NTP sync OK: " + String(server));
+      return true;
+    }
+    delay(delayMs);
+    if (!stop_wdt) esp_task_wdt_reset();
+  }
+  logWarning("NTP sync failed: " + String(server));
+  return false;
+}
+
+String formatTimeFromEpoch(unsigned long epoch) {
+  if (epoch == 0) return "time not synced";
+  unsigned long secDay = epoch % 86400;
+  int h = secDay / 3600;
+  int m = (secDay % 3600) / 60;
+  int s = secDay % 60;
+  char buf[9];
+  snprintf(buf, sizeof(buf), "%02d:%02d:%02d", h, m, s);
+  return String(buf);
+}
+
+bool ntpFastPoll(void *);
+bool ntpSlowPoll(void *);
+void scheduleNtpFast();
+void scheduleNtpSlow();
+
 // reset_bad_conn_timer 找錯中...
 int bad_conn_count = 0;
 int cannotcanceltimerrrrrr = 0;
 bool overheat(void *argument /* optional argument given to in/at/every */) {
     Serial.println("overheat overheat overheat");
+    logWarning("Pump overheat protection triggered");
     request_pump_to(OVERHEAT_PROTECTION);
     timer_2.cancel();
     Serial.println("log for timer1");
@@ -81,6 +231,7 @@ void pump_run(long forHowLong_ms = timer_2_interval){
   digitalWrite(GPIO4PUMP, LOW);
   pump_status = RUNNING;
   ms = millis();
+  logVerbose("Pump started (duration: " + String(forHowLong_ms/1000) + "s)");
   timer_2.in(forHowLong_ms, overheat);
 }
 void pump_stop(){
@@ -89,12 +240,14 @@ void pump_stop(){
     digitalWrite(GPIO4PUMP, HIGH);
     pump_status = STOPPED;
     ms = millis();
+    logVerbose("Pump stopped");
 }
 bool recover_from_overheat(void *argument /* optional argument given to in/at/every */) {
     timer_3.cancel();
-    
+
     set_timer_blink_interval_to(normal_blink_interval);
     Serial.println("recover from overheat (過熱保護復歸)");
+    logVerbose("Recovered from overheat protection");
     pump_status = STOPPED;
     ms = millis();
     if (!isBadTime()) request_pump_to(RUNNING); // check_water_level(); // pump_run();
@@ -110,10 +263,24 @@ void pump_overheat_protect(long forHowLong_ms = timer_3_interval){
   ms = millis();
   timer_3.in(forHowLong_ms, recover_from_overheat);
 }
+bool stop_manual_pump(void *argument /* optional argument given to in/at/every */) {
+  timer_manual_pump.cancel();
+  Serial.println("Manual pump run finished, stopping pump");
+  logVerbose("Manual pump timer expired - stopping");
+  pump_stop();
+  return false; // one-shot
+}
+void manual_pump_start() {
+  Serial.println("Manual pump start for 5 minutes (GPIO4PUMP)");
+  logVerbose("Manual pump started (5 min)");
+  timer_manual_pump.cancel();
+  request_pump_to(RUNNING);
+  timer_manual_pump.in(manual_pump_duration_ms, stop_manual_pump);
+}
 void request_pump_to(PumpStatus status) {
-  
+
   if (bad_conn_mode) return;
-  switch (status) {  
+  switch (status) {
     case RUNNING:
       if (pump_status == RUNNING){
         Serial.println("pump is running");
@@ -148,12 +315,18 @@ void request_pump_to(PumpStatus status) {
 bool go_bad_conn_mode (void *argument /* optional argument given to in/at/every */) {
   Serial.println("[go_bad_conn_mode] triggered ! !");
   Serial.println("[go_bad_conn_mode] triggered ! !");
+  logError("Bad connection mode activated - pump force stopped");
   bad_conn_count++;
   bad_conn_mode = true;
   pump_stop(); // force stop pump
   set_timer_blink_interval_to(badconnmode_blink_interval);
   Serial.println("log for timer3");
   return true;
+}
+
+void record_command(const String &name) {
+  lastCommand = name;
+  lastCommandMs = millis();
 }
 void reset_bad_conn_timer() {
   Serial.println("log for reset_bad_conn_timer1");
@@ -178,15 +351,18 @@ void check_water_level (float desiredMinWaterLevel, bool if_reset_bad_conn_timer
   if (message.toFloat() != 0) {
     float num = message.toFloat();
     Serial.println("[check_water_level] Water level: " + String(num) + ". (desiredMinWaterLevel: " + desiredMinWaterLevel + ", MAX_WATER_LEVEL: " + MAX_WATER_LEVEL + ")");
+    logVerbose("Water level: " + String(num, 1) + " (min:" + String(desiredMinWaterLevel, 1) + " max:" + String(MAX_WATER_LEVEL, 1) + ")");
     Serial.println("log for check_water_level1");
     if (if_reset_bad_conn_timer) reset_bad_conn_timer();
     Serial.println("log for check_water_level2");
     if (num < desiredMinWaterLevel){
       Serial.println(" !! BELOW desiredMinWaterLevel (" + String(desiredMinWaterLevel) + ") !! ");
+      logWarning("Water BELOW min (" + String(num, 1) + " < " + String(desiredMinWaterLevel, 1) + ")");
       //requested the pump to start
       request_pump_to(RUNNING);
     }else if (num > MAX_WATER_LEVEL){
       Serial.println(" !! OVER MAX_WATER_LEVEL (" + String(MAX_WATER_LEVEL) + ") !! ");
+      logVerbose("Water OVER max (" + String(num, 1) + " > " + String(MAX_WATER_LEVEL, 1) + ")");
       //requested the pump to stop
       request_pump_to(STOPPED); //lock from entering RUNNING status for a period of time after pump stopped
     }
@@ -204,6 +380,7 @@ bool relay_reset(void *argument /* optional argument given to in/at/every */) {
   return true;
 }
 void frontdoor_control(String value){ // frontdoor control/relay control
+  logVerbose("Frontdoor: " + value);
   if (value == "up"){
     digitalWrite(GPIO4UP, LOW);
     timer_relay.cancel();
@@ -248,20 +425,16 @@ bool isTimeInRange (void *argument /* optional argument given to in/at/every */)
   return true;
 }
 bool isBadTime() {
-  if (timeClient.update() < 0) { // Get the current time from NTP server
-    return false; // Failed to update time
-  }
-  // Extract hours from the formatted time string
-  String formattedTime = timeClient.getFormattedTime();
-  int hours = formattedTime.substring(0, 2).toInt(); // Extract first two characters and convert to integer
-  // Check if the time is between 22 and 6
+  if (lastTimeEpoch == 0 || lastTimeSyncMs == 0) return false; // no sync yet
+  unsigned long nowMs = millis();
+  unsigned long nowEpoch = lastTimeEpoch + ((nowMs - lastTimeSyncMs) / 1000);
+  int hours = (nowEpoch % 86400) / 3600;
   if (hours >= isBadTimeBetween_from || hours < isBadTimeBetween_to) {
-    Serial.println("isBadtime : True (" + formattedTime + ")");
+    Serial.println("isBadtime : True (cached epoch)");
     return true;
-  } else {
-    Serial.println("isBadtime : False (" + formattedTime + ")");
-    return false;
   }
+  Serial.println("isBadtime : False (cached epoch)");
+  return false;
 }
 void setup() {
   Serial.begin(115200);
@@ -287,9 +460,14 @@ void setup() {
   WiFi.config(staticIP, gateway, subnet);
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
-  if (WiFi.waitForConnectResult() != WL_CONNECTED) {
+  unsigned long wifiStart = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < 30000) {
+    delay(500);
+    if (!stop_wdt) esp_task_wdt_reset();
+  }
+  if (WiFi.status() != WL_CONNECTED) {
     Serial.printf("ERROR! >> WiFi Failed!");
-    ESP.restart();
+    // Disable auto-restart to avoid reboot loops; stay alive for troubleshooting.
     return;
   }
   Serial.print("IP Address: ");
@@ -298,49 +476,65 @@ void setup() {
   Serial.println(WiFi.macAddress());
   if (WiFi.localIP().toString().equals(myip) == false) {
     Serial.println("ERROR! >> WRONG IP Address, please check Router's setting (now ip:" + WiFi.localIP().toString() + ")");
-    ESP.restart();
+    // Disable auto-restart to avoid reboot loops; stay alive for troubleshooting.
     return;
   }
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
-    String s1 = "P\nR\nO\nJ\nE\nC\nT\nSHUI\nYAAA\n\nFile name: \"wd_project_pump_side.ino\".";
-    String s2 = "\n\nWater Tank level now = " + message + ".";
-    String s2_2 = "\n\n(auto control range (water level): " + String(MIN_WATER_LEVEL) + "~" + String(MAX_WATER_LEVEL) + ")";
-    String s2_3 = "\n\n(pre_fill_up time range: " + String(isTimeInRange_min) + ":00 ~ " + String(isTimeInRange_max) + ":00, trigger water level : " + String(DEFICIENT_WATER_LEVEL) + ")";
-    String s3 = "\n\n(Bad connection mode status = " + String(bad_conn_mode) + ". (count = " + bad_conn_count + ") (cancel timer failed " + cannotcanceltimerrrrrr + " times)";
-    String s4 = "\n\nNow pump status = ";
-    float time_since_last_state_change = (millis() - ms) / 1000.0 / 60.0;
-    String s4_2 = ". (time since last state change: " + String(time_since_last_state_change) + " minutes)";
-    String s5 = "\n\n(isBadtime : "; //is bad time
-    String s5_2 = ". (badtime form " + String(isBadTimeBetween_from) + ":00 ~ " + String(isBadTimeBetween_to) + ":00)";
-    timeClient.update(); // Get the current time from NTP server
-    String formattedTime = timeClient.getFormattedTime();
-    String s6 = "\n\n(web page update at: " + formattedTime + ")";
-    String s7 = "\n\n(upTime: " + String(millis()/1000) + "s)";
-    if (isBadTime()) { // s5
-      s5 += "True)";
-    } else {
-      s5 += "False)";
-    }
-    switch (pump_status) { // s4_2
-      case RUNNING:
-        s4 += "RUNNING";
-        break;
-      case STOPPED:
-        s4 += "STOPPED";
-        break;
-      case OVERHEAT_PROTECTION:
-        s4 += "OVERHEAT_PROTECTION";
-        break;
-      default:
-        s4 += "Unknown Status";
-        break;
-  }
-    request->send(200, "text/plain", s1 + s2 + s4 + s4_2 + s2_2 + s2_3 + s3 + s5 + s5_2 + s6 + s7);
+    request->send(200, "text/html", getHtmlContent());
   });
-  server.on("/info/", HTTP_GET, [](AsyncWebServerRequest *request) { 
+  server.on("/info/", HTTP_GET, [](AsyncWebServerRequest *request) {
     // String htmlContent = "<html><body><input type=button value=hello><p>a1: " + message + "</p></body></html>";
     String htmlContent = getHtmlContent();
     request->send(200, "text/html", htmlContent);
+  });
+  server.on("/logs.json", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send(200, "application/json", getLogsJson());
+  });
+  server.on("/clearlogs", HTTP_GET, [](AsyncWebServerRequest *request) {
+    clearLogs();
+    logVerbose("Logs cleared by user");
+    request->send(200, "text/plain", "Logs cleared");
+  });
+  server.on("/status.json", HTTP_GET, [](AsyncWebServerRequest *request) {
+    String pumpStatusText = "Unknown";
+    switch (pump_status) {
+      case RUNNING: pumpStatusText = "RUNNING"; break;
+      case STOPPED: pumpStatusText = "STOPPED"; break;
+      case OVERHEAT_PROTECTION: pumpStatusText = "OVERHEAT_PROTECTION"; break;
+      default: break;
+    }
+    unsigned long nowMs = millis();
+    float minutesSinceChange = (nowMs - ms) / 1000.0 / 60.0;
+    unsigned long epochFromCache = lastTimeEpoch > 0 ? lastTimeEpoch + ((nowMs - lastTimeSyncMs) / 1000) : 0;
+    String formattedTime = formatTimeFromEpoch(epochFromCache);
+    String badTimeText = isBadTime() ? "True" : "False";
+    unsigned long timeSinceSyncMs = lastTimeSyncMs > 0 ? nowMs - lastTimeSyncMs : 0;
+    unsigned long lastCmdSinceMs = lastCommandMs > 0 ? nowMs - lastCommandMs : 0;
+
+    String json;
+      json.reserve(768);
+    json += "{";
+    json += "\"water\":\"" + message + "\",";
+    json += "\"pump_status\":\"" + pumpStatusText + "\",";
+    json += "\"minutes_since_change\":" + String(minutesSinceChange, 2) + ",";
+    json += "\"bad_conn_mode\":" + String(bad_conn_mode ? 1 : 0) + ",";
+    json += "\"bad_conn_count\":" + String(bad_conn_count) + ",";
+    json += "\"bad_cancel_fail\":" + String(cannotcanceltimerrrrrr) + ",";
+    json += "\"time\":\"" + formattedTime + "\",";
+    json += "\"time_epoch\":" + String(epochFromCache) + ",";
+    json += "\"time_server\":\"" + lastTimeServer + "\",";
+    json += "\"time_since_sync_s\":" + String(timeSinceSyncMs / 1000.0, 2) + ",";
+    json += "\"is_badtime\":\"" + badTimeText + "\",";
+    json += "\"min_level\":" + String(MIN_WATER_LEVEL, 2) + ",";
+    json += "\"max_level\":" + String(MAX_WATER_LEVEL, 2) + ",";
+    json += "\"deficient_level\":" + String(DEFICIENT_WATER_LEVEL, 2) + ",";
+    json += "\"prefill_from\":" + String(isTimeInRange_min) + ",";
+    json += "\"prefill_to\":" + String(isTimeInRange_max) + ",";
+    json += "\"uptime_s\":" + String(nowMs / 1000) + ",";
+    json += "\"last_command\":\"" + lastCommand + "\",";
+    json += "\"last_command_since_s\":" + String(lastCmdSinceMs / 1000.0, 2) + "";
+    json += "}";
+    request->send(200, "application/json", json);
   });
   // Send a GET request to <IP>/get?message=<message>
   server.on("/get", HTTP_GET, [](AsyncWebServerRequest *request) {
@@ -352,6 +546,16 @@ void setup() {
       String value = request->getParam(PARAM_INPUT_FRONTDOOR)->value();
       temp = "recived command: frontdoor= " + value;
       frontdoor_control(value);
+      record_command("frontdoor:" + value);
+    } else if (request->hasParam(PARAM_INPUT_MANUALPUMP)) {
+      temp = "recived command: manual pump run";
+      manual_pump_start();
+      record_command("manualpump");
+    } else if (request->hasParam(PARAM_INPUT_MANUALPUMPSTOP)) {
+      temp = "recived command: manual pump stop";
+      timer_manual_pump.cancel();
+      request_pump_to(STOPPED);
+      record_command("manualpumpstop");
     } else if (request->hasParam(PARAM_INPUT_SETMAXLEVEL)){
       String value = request->getParam(PARAM_INPUT_SETMAXLEVEL)->value();
       temp = "recived command: set max water level to " + value;
@@ -360,6 +564,7 @@ void setup() {
         MAX_WATER_LEVEL  = f;
         DEFICIENT_WATER_LEVEL = (MAX_WATER_LEVEL - MIN_WATER_LEVEL) * 0.3 + MIN_WATER_LEVEL;
       }
+      record_command("setmax:" + value);
     } else if (request->hasParam(PARAM_INPUT_SETMINLEVEL)){
       String value = request->getParam(PARAM_INPUT_SETMINLEVEL)->value();
       temp = "recived command: set min water level to " + value;
@@ -368,6 +573,7 @@ void setup() {
         MIN_WATER_LEVEL = f;
         DEFICIENT_WATER_LEVEL = (MAX_WATER_LEVEL - MIN_WATER_LEVEL) * 0.3 + MIN_WATER_LEVEL;
       }
+      record_command("setmin:" + value);
     } else {
       message = temp;
       temp = "No message sent";
@@ -392,138 +598,620 @@ void setup() {
   request->send(404, "text/plain", "Not found");
   });
   server.begin();
-  // 20230808 ntp 時間功能
-  timeClient.begin(); // Initialize and configure NTP client
-  timeClient.setTimeOffset(8 * 3600); // Set time offset to +8 hours (8 * 3600 seconds)
-  timer_ntp.every(timer_ntp_interval, isTimeInRange);
-  set_timer_blink_interval_to(normal_blink_interval);
-  timer_1.in(timer_1_delay, fill_up);
-  reset_bad_conn_timer(); // timer_bad_connection
+
+  // 20230808 ntp 時間功能 // 20251030 修理
+  // timeClient.begin(); // Initialize and configure NTP client
+  // timeClient.setTimeOffset(8 * 3600); // Set time offset to +8 hours (8 * 3600 seconds)
+  // timer_ntp.every(timer_ntp_interval, isTimeInRange);
+  // set_timer_blink_interval_to(normal_blink_interval);
+  // timer_1.in(timer_1_delay, fill_up);
+  // reset_bad_conn_timer(); // timer_bad_connection
+  // // Force initial update with retry
+  // int retryCount = 0;
+  // while (!timeClient.update() && retryCount < 5) {
+  //   Serial.println("Failed to get time from NTP server, retrying...");
+  //   timeClient.forceUpdate();
+  //   delay(2000);
+  //   retryCount++;
+  // }
+  // if (retryCount >= 5) {
+  //   Serial.println("WARNING: Could not sync with NTP server!");
+  // } else {
+  //   Serial.println("NTP time synchronized: " + timeClient.getFormattedTime());
+  // }
+
+  // Try multiple NTP servers (names first, then direct IP fallbacks)
+  bool ntpSuccess = false;
+  const int ntpServerCount = sizeof(ntpServers) / sizeof(ntpServers[0]);
+  for (int i = 0; i < ntpServerCount && !ntpSuccess; i++) {
+    ntpSuccess = syncTimeWithServer(ntpServers[i], 4, 2000);
+    if (ntpSuccess) currentNtpServerIndex = i;
+  }
+
+  const int ntpIpFallbackCount = sizeof(ntpServersIpFallback) / sizeof(ntpServersIpFallback[0]);
+  for (int i = 0; i < ntpIpFallbackCount && !ntpSuccess; i++) {
+    Serial.println("DNS may be blocked, trying direct NTP IP fallback...");
+    ntpSuccess = syncTimeWithServer(ntpServersIpFallback[i], 4, 2000);
+    if (ntpSuccess) currentNtpServerIndex = -1; // indicates IP fallback
+  }
+
+  if (!ntpSuccess) {
+    Serial.println("ERROR: All NTP servers (names and IPs) failed!");
+  }
+
+  if (ntpSuccess) {
+    scheduleNtpSlow();
+  } else {
+    scheduleNtpFast();
+  }
+
+  logVerbose("System startup complete");
   ms = millis();
 }
 String getHtmlContent(){
-  return "<!DOCTYPE html>\n\
-<html>\n\
-<head>\n\
-  <title>iHOME remote</title>\n\
-  <style>\n\
-    * {\n\
-      box-sizing: border-box;\n\
-    }\n\
-    body {\n\
-      margin: 0;\n\
-      padding: 20px;\n\
-    }\n\
-    .remote-container {\n\
-      width: 100%;\n\
-      height: 100vh;\n\
-      background-color: silver;\n\
-      display: flex;\n\
-      flex-direction: column;\n\
-      align-items: center;\n\
-      justify-content: center;\n\
-      border-radius: 20px;\n\
-      padding: 20px;\n\
-    }\n\
-    .panel {\n\
-      width: 80%;\n\
-      max-width: 400px;\n\
-      height: 90%;\n\
-      max-height: 600px;\n\
-      background-color: white;\n\
-      display: flex;\n\
-      flex-direction: column;\n\
-      align-items: center;\n\
-      justify-content: center;\n\
-      padding: 20px;\n\
-      border-radius: 20px;\n\
-    }\n\
-    .button-row {\n\
-      display: flex;\n\
-      justify-content: center;\n\
-      margin-bottom: 20px;\n\
-    }\n\
-    .button {\n\
-      display: flex;\n\
-      flex-direction: column;\n\
-      align-items: center;\n\
-      justify-content: center;\n\
-      width: 80px;\n\
-      height: 80px;\n\
-      background-color: #ccc;\n\
-      margin: 10px;\n\
-      border-radius: 50%;\n\
-      font-size: 24px;\n\
-      text-decoration: none;\n\
-      color: black;\n\
-      transition: background-color 0.3s;\n\
-    }\n\
-    .button:hover {\n\
-      background-color: #ddd;\n\
-    }\n\
-    .led {\n\
-      width: 20px;\n\
-      height: 20px;\n\
-      border-radius: 50%;\n\
-      background-color: black;\n\
-      transition: background-color 0.3s;\n\
-      margin-bottom: 20px;\n\
-    }\n\
-    .led.on {\n\
-      background-color: red;\n\
-    }\n\
-    .caption {\n\
-      margin-top: 10px;\n\
-      font-size: 14px;\n\
-      font-weight: bold;\n\
-    }\n\
-    @media only screen and (max-width: 768px) {\n\
-      /* For mobile devices */\n\
-      .remote-container {\n\
-        padding: 10px;\n\
-      }\n\
-      .panel {\n\
-        width: 90%;\n\
-        height: 90%;\n\
-        max-height: 600px;\n\
-      }\n\
-    }\n\
-  </style>\n\
-</head>\n\
-<body>\n\
-  <div class=\"remote-container\">\n\
-    <div class=\"panel\">\n\
-      <div class=\"led\"></div>\n\
-      <div class=\"button-row\">\n\
-        <a href=\"http://192.168.0.112/get?frontdoor=up\" target=\"_blank\" class=\"button\" onclick=\"event.preventDefault(); activateLed(); openUrl(this.href); playSound();\">UPUP</a>\n\
-        <a href=\"http://192.168.0.112/get?frontdoor=down\" target=\"_blank\" class=\"button\" onclick=\"event.preventDefault(); activateLed(); openUrl(this.href); playSound();\">DOWN</a>\n\
-      </div>\n\
-      <a href=\"http://192.168.0.112/get?frontdoor=stop\" target=\"_blank\" class=\"button\" onclick=\"event.preventDefault(); activateLed(); openUrl(this.href); playSound();\">STOP</a>\n\
-    </div>\n\
-  </div>\n\
-  <audio id=\"click-sound\" src=\"https://example.com/click.mp3\"></audio>\n\
-  <script>\n\
-    function activateLed() {\n\
-      var led = document.querySelector('.led');\n\
-      led.classList.add('on');\n\
-      setTimeout(function() {\n\
-        led.classList.remove('on');\n\
-      }, 2000);\n\
-    }\n\
-    function openUrl(url) {\n\
-      window.open(url, '_blank');\n\
-    }\n\
-    function playSound() {\n\
-      document.getElementById('click-sound').play();\n\
-    }\n\
-  </script>\n\
-</body>\n\
-</html>";
+  // Collect dynamic values for display
+  String pumpStatusText = "Unknown";
+  switch (pump_status) {
+    case RUNNING: pumpStatusText = "RUNNING"; break;
+    case STOPPED: pumpStatusText = "STOPPED"; break;
+    case OVERHEAT_PROTECTION: pumpStatusText = "OVERHEAT_PROTECTION"; break;
+    default: break;
+  }
+
+  float minutesSinceChange = (millis() - ms) / 1000.0 / 60.0;
+  String formattedTime = timeClient.getFormattedTime(); // non-blocking cached time
+  if (formattedTime == "") formattedTime = "use Refresh";
+  String badTimeText = "see status.json";
+  String statusClass = "status";
+  if (pump_status == RUNNING) statusClass += " on";
+  else if (pump_status == OVERHEAT_PROTECTION) statusClass += " hold";
+
+  String html;
+  html.reserve(7000);
+  html = R"HTML(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>iHOME Remote</title>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600&display=swap');
+    :root {
+      --bg: #05131e;
+      --card: rgba(10, 35, 54, 0.78);
+      --accent: #22d3ee;
+      --accent-strong: #0ea5e9;
+      --text: #e6f6ff;
+      --muted: #b7d9ec;
+      --shadow: 0 14px 45px rgba(0,0,0,0.35);
+      --radius: 18px;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: 'Space Grotesk', system-ui, sans-serif;
+      background: radial-gradient(circle at 20% 20%, rgba(34,211,238,0.12), transparent 34%),
+          radial-gradient(circle at 78% 10%, rgba(14,165,233,0.12), transparent 32%),
+          linear-gradient(135deg, #04101c 0%, #0a2035 100%);
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+    }
+    .shell {
+      width: min(960px, 100%);
+      background: var(--card);
+      border: 1px solid rgba(255,255,255,0.09);
+      border-radius: var(--radius);
+      padding: 28px;
+      box-shadow: var(--shadow);
+    }
+    .header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 18px;
+    }
+    .header-actions { display: inline-flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+    .title {
+      font-size: 24px;
+      font-weight: 600;
+      letter-spacing: 0.4px;
+    }
+    .status {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 14px;
+      border-radius: 999px;
+      background: rgba(255,255,255,0.07);
+      color: var(--muted);
+      font-size: 14px;
+      border: 1px solid rgba(255,255,255,0.08);
+    }
+    .status .dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: var(--muted);
+      box-shadow: 0 0 12px rgba(255,255,255,0.15);
+    }
+    .status.on { color: var(--text); }
+    .status.on .dot { background: var(--accent); box-shadow: 0 0 12px rgba(251,146,60,0.55); }
+    .status.hold .dot { background: var(--accent-strong); box-shadow: 0 0 12px rgba(249,115,22,0.6); }
+    .status.action { cursor: pointer; border: 1px solid rgba(255,255,255,0.1); background: rgba(255,255,255,0.05); gap: 6px; }
+    .status.action:hover { border-color: rgba(255,255,255,0.2); background: rgba(255,255,255,0.08); }
+    .status.action svg { width: 14px; height: 14px; fill: var(--text); opacity: 0.9; }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 14px;
+    }
+    .card {
+      background: rgba(255,255,255,0.08);
+      border: 1px solid rgba(255,255,255,0.10);
+      border-radius: 16px;
+      padding: 18px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      transition: transform 0.2s ease, border 0.2s ease;
+    }
+    .card:hover { transform: translateY(-2px); border-color: rgba(255,255,255,0.1); }
+    .label { color: var(--muted); font-size: 14px; }
+    .button {
+      width: 100%;
+      padding: 14px;
+      border-radius: 12px;
+      font-size: 16px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: transform 0.12s ease, box-shadow 0.12s ease, border 0.12s ease;
+      border: 1px solid transparent;
+      color: #0c111b;
+      background: var(--accent);
+      box-shadow: 0 10px 26px rgba(0,0,0,0.25);
+    }
+    .button:active { transform: translateY(1px); }
+    .button.accent { background: var(--accent); }
+    .button.outline {
+      background: rgba(255,255,255,0.06);
+      color: var(--text);
+      border: 1px solid rgba(255,255,255,0.22);
+      box-shadow: none;
+    }
+    .button.small { width: auto; padding: 10px 12px; font-size: 14px; }
+    .toast {
+      margin-top: 6px;
+      font-size: 13px;
+      color: var(--muted);
+      min-height: 18px;
+    }
+    .stats {
+      margin-top: 18px;
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 12px;
+    }
+    .log-panel {
+      margin-top: 18px;
+      background: rgba(255,255,255,0.07);
+      border: 1px solid rgba(255,255,255,0.10);
+      border-radius: 14px;
+      padding: 14px;
+      box-shadow: var(--shadow);
+    }
+    .log-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 10px;
+    }
+    .log-title {
+      font-size: 16px;
+      font-weight: 600;
+      color: var(--text);
+    }
+    .log-box {
+      background: #0d1117;
+      border: 1px solid rgba(255,255,255,0.12);
+      border-radius: 10px;
+      padding: 12px;
+      color: #c9d1d9;
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+      font-size: 12px;
+      line-height: 1.6;
+      max-height: 280px;
+      overflow: auto;
+      white-space: pre;
+    }
+    .log-entry { display: block; padding: 2px 0; border-bottom: 1px solid rgba(255,255,255,0.05); }
+    .log-entry:last-child { border-bottom: none; }
+    .log-level { font-weight: 600; padding: 1px 6px; border-radius: 4px; margin-right: 6px; font-size: 10px; text-transform: uppercase; }
+    .log-level.error { background: #f8514966; color: #ff7b72; }
+    .log-level.warning { background: #d29922aa; color: #f0e68c; }
+    .log-level.verbose { background: #388bfd44; color: #79c0ff; }
+    .log-time { color: #8b949e; margin-right: 8px; }
+    .log-action { color: #c9d1d9; }
+    .stat {
+      background: rgba(255,255,255,0.07);
+      border: 1px solid rgba(255,255,255,0.10);
+      border-radius: 14px;
+      padding: 14px;
+      backdrop-filter: blur(5px);
+    }
+    .stat-label { color: var(--muted); font-size: 13px; margin-bottom: 4px; }
+    .stat-value { font-size: 20px; font-weight: 600; color: var(--text); }
+    .stat-foot { color: var(--muted); font-size: 12px; margin-top: 6px; line-height: 1.4; }
+    @media (max-width: 640px) {
+      body { padding: 16px; }
+      .shell { padding: 22px; }
+      .header { flex-direction: column; align-items: flex-start; gap: 10px; }
+      .header-actions { width: 100%; justify-content: flex-start; }
+      .header-actions .status { padding: 8px 12px; }
+      .title { font-size: 20px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+)HTML";
+
+  html += "    <div class=\"header\"><div class=\"title\">iHOME Remote</div><div class=\"header-actions\"><div id=\"header-status\" class=\"" + statusClass + "\"><span class=\"dot\"></span>" + pumpStatusText + "</div><button class=\"status action\" id=\"refresh-btn\" aria-label=\"Refresh\"><svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"M12 4a8 8 0 1 1-7.75 10h1.7a6.3 6.3 0 1 0 .06-4.99l2.19-2.18V12H3V6.06l2.02 2.02A8 8 0 0 1 12 4Z\"></path></svg><span>Refresh</span></button></div></div>";
+
+  html += R"HTML(
+    <div class="grid">
+      <div class="card">
+        <div class="label">Garage Door</div>
+        <button class="button accent" onclick="sendCommand('up')">Up</button>
+        <button class="button accent" onclick="sendCommand('down')">Down</button>
+        <button class="button outline" onclick="sendCommand('stop')">Stop</button>
+        <div class="toast" id="door-toast"></div>
+      </div>
+      <div class="card">
+        <div class="label">Pump (GPIO4PUMP)</div>
+        <button class="button accent" onclick="sendCommand('pump')">Run 5 minutes</button>
+        <button class="button outline" onclick="sendCommand('pumpStop')">Stop now</button>
+        <div class="toast" id="pump-toast"></div>
+      </div>
+    </div>
+
+    <div class="toast" id="refresh-toast"></div>
+
+    <div class="stats">
+)HTML";
+
+  html += "      <div class=\"stat\"><div class=\"stat-label\">Water Level</div><div id=\"stat-water\" class=\"stat-value\">" + message + "</div><div id=\"stat-range\" class=\"stat-foot\">Auto range: " + String(MIN_WATER_LEVEL, 2) + " - " + String(MAX_WATER_LEVEL, 2) + "</div></div>";
+  html += "      <div class=\"stat\"><div class=\"stat-label\">Pump</div><div id=\"stat-pump\" class=\"stat-value\">" + pumpStatusText + "</div><div id=\"stat-pump-foot\" class=\"stat-foot\">Time since last change: " + String(minutesSinceChange, 2) + " min</div></div>";
+  html += "      <div class=\"stat\"><div class=\"stat-label\">Bad Connection</div><div id=\"stat-bad\" class=\"stat-value\">" + String(bad_conn_mode ? 1 : 0) + "</div><div id=\"stat-bad-foot\" class=\"stat-foot\">Count: " + String(bad_conn_count) + " | Cancel fail: " + String(cannotcanceltimerrrrrr) + "</div></div>";
+  html += "      <div class=\"stat\"><div class=\"stat-label\">Time</div><div id=\"stat-time\" class=\"stat-value\">" + formattedTime + "</div><div id=\"stat-time-foot\" class=\"stat-foot\">isBadtime: " + badTimeText + " | Prefill: " + String(isTimeInRange_min) + ":00-" + String(isTimeInRange_max) + ":00 (" + String(DEFICIENT_WATER_LEVEL, 2) + ")</div></div>";
+  html += "      <div class=\"stat\"><div class=\"stat-label\">Uptime</div><div id=\"stat-uptime\" class=\"stat-value\">" + String(millis() / 1000) + " s</div><div id=\"stat-uptime-foot\" class=\"stat-foot\"></div></div>";
+
+  html += R"HTML(
+    </div>
+
+    <div class="log-panel">
+      <div class="log-header">
+        <div class="log-title">Logs <span id="log-count" style="font-weight:400;font-size:13px;color:var(--muted);">(0/" + String(LOG_BUFFER_SIZE) + ")</span></div>
+        <div style="display:flex;gap:8px;align-items:center;">
+          <select id="log-filter" class="status action" style="padding:8px 12px;border-radius:8px;font-size:13px;cursor:pointer;font-family:'Space Grotesk',system-ui,sans-serif;font-weight:600;gap:6px;">
+            <option value="2">All Logs</option>
+            <option value="1" selected>Warning+</option>
+            <option value="0">Errors Only</option>
+          </select>
+          <button class="status action" id="log-clear-btn" style="padding:8px 12px;border-radius:8px;font-size:13px;cursor:pointer;font-family:'Space Grotesk',system-ui,sans-serif;font-weight:600;gap:6px;">Clear</button>
+        </div>
+      </div>
+      <div id="log-output" class="log-box">Loading logs...</div>
+    </div>
+  </div>
+  <script>
+    const LOG_BUFFER_SIZE = " + String(LOG_BUFFER_SIZE) + ";
+    const actions = {
+      up: '/get?frontdoor=up',
+      down: '/get?frontdoor=down',
+      stop: '/get?frontdoor=stop',
+      pump: '/get?manualpump=1',
+      pumpStop: '/get?manualpumpstop=1'
+    };
+
+    const toasts = {
+      up: document.getElementById('door-toast'),
+      down: document.getElementById('door-toast'),
+      stop: document.getElementById('door-toast'),
+      pump: document.getElementById('pump-toast'),
+      pumpStop: document.getElementById('pump-toast'),
+      refresh: document.getElementById('refresh-toast')
+    };
+
+    function showToast(key, text) {
+      const el = toasts[key];
+      if (!el) return;
+      el.textContent = text;
+      setTimeout(() => { if (el.textContent === text) el.textContent = ''; }, 2600);
+    }
+
+    async function sendCommand(key) {
+      const url = actions[key];
+      if (!url) return;
+      try {
+        showToast(key, 'Sending...');
+        const res = await fetch(url, { method: 'GET' });
+        if (!res.ok) throw new Error('Request failed');
+        showToast(key, 'Done');
+      } catch (err) {
+        showToast(key, 'Error: ' + err.message);
+      }
+    }
+
+    // Poll for status without reloading the page
+    const els = {
+      headerStatus: document.getElementById('header-status'),
+      water: document.getElementById('stat-water'),
+      range: document.getElementById('stat-range'),
+      pump: document.getElementById('stat-pump'),
+      pumpFoot: document.getElementById('stat-pump-foot'),
+      bad: document.getElementById('stat-bad'),
+      badFoot: document.getElementById('stat-bad-foot'),
+      time: document.getElementById('stat-time'),
+      timeFoot: document.getElementById('stat-time-foot'),
+      uptime: document.getElementById('stat-uptime'),
+      uptimeFoot: document.getElementById('stat-uptime-foot')
+    };
+
+    const logOutput = document.getElementById('log-output');
+    const logClearBtn = document.getElementById('log-clear-btn');
+    const logCountEl = document.getElementById('log-count');
+    const logFilter = document.getElementById('log-filter');
+    let allLogs = []; // Store all logs for filtering
+    let currentFilterLevel = 1; // Default: WARNING+ (0=ERROR, 1=WARNING, 2=VERBOSE)
+
+    function formatLogTime(ms, time) {
+      const msStr = String(ms).padStart(10, ' ');
+      const timeStr = time && time !== 'time not synced' ? time : '--------';
+      return msStr + 'ms | ' + timeStr;
+    }
+
+    function renderLogs(logs, filterLevel) {
+      if (!logOutput) return;
+      // Filter logs: show logs where level <= filterLevel (ERROR=0, WARNING=1, VERBOSE=2)
+      const filtered = logs.filter(log => log.lv <= filterLevel);
+      if (!logs || logs.length === 0) {
+        logOutput.innerHTML = '<span style="color:#8b949e;">No logs yet...</span>';
+        if (logCountEl) logCountEl.textContent = '(0/256)';
+        return;
+      }
+      const filterName = filterLevel === 0 ? 'err' : filterLevel === 1 ? 'warn+' : 'all';
+      if (logCountEl) logCountEl.textContent = '(' + filtered.length + '/' + logs.length + ' ' + filterName + ')';
+      if (filtered.length === 0) {
+        logOutput.innerHTML = '<span style="color:#8b949e;">No logs match filter...</span>';
+        return;
+      }
+      // Render newest first
+      const reversed = [...filtered].reverse();
+      let html = '';
+      for (const log of reversed) {
+        const levelClass = log.level.toLowerCase();
+        const timeStr = formatLogTime(log.ms, log.time);
+        html += '<div class="log-entry">';
+        html += '<span class="log-level ' + levelClass + '">' + log.level + '</span>';
+        html += '<span class="log-time">' + timeStr + '</span>';
+        html += '<span class="log-action">' + log.action + '</span>';
+        html += '</div>';
+      }
+      logOutput.innerHTML = html;
+    }
+
+    async function fetchLogs() {
+      try {
+        const res = await fetch('/logs.json', { cache: 'no-store' });
+        if (!res.ok) throw new Error('Logs fetch failed');
+        allLogs = await res.json();
+        renderLogs(allLogs, currentFilterLevel);
+      } catch (err) {
+        if (logOutput) logOutput.innerHTML = '<span style="color:#ff7b72;">Error: ' + err.message + '</span>';
+      }
+    }
+
+    async function clearLogs() {
+      try {
+        const res = await fetch('/clearlogs', { cache: 'no-store' });
+        if (!res.ok) throw new Error('Clear failed');
+        allLogs = [];
+        fetchLogs();
+      } catch (err) {
+        if (logOutput) logOutput.innerHTML = '<span style="color:#ff7b72;">Error: ' + err.message + '</span>';
+      }
+    }
+
+    if (logClearBtn) {
+      logClearBtn.addEventListener('click', clearLogs);
+    }
+
+    if (logFilter) {
+      logFilter.addEventListener('change', (e) => {
+        currentFilterLevel = parseInt(e.target.value, 10);
+        renderLogs(allLogs, currentFilterLevel);
+      });
+    }
+
+    let lastStatus = {};
+    let timeBaseEpoch = null;
+    let timeBaseClientMs = null;
+    let timeTicker = null;
+
+    function updateText(el, text, key) {
+      if (!el || text === undefined || text === null) return;
+      if (lastStatus[key] !== text) {
+        el.textContent = text;
+        lastStatus[key] = text;
+      }
+    }
+
+    function updateStatusClass(statusText) {
+      if (!els.headerStatus) return;
+      els.headerStatus.classList.remove('on', 'hold');
+      if (statusText === 'RUNNING') els.headerStatus.classList.add('on');
+      else if (statusText === 'OVERHEAT_PROTECTION') els.headerStatus.classList.add('hold');
+    }
+
+    function formatClock(epochSeconds, deltaMs = 0) {
+      const d = new Date((Number(epochSeconds) || 0) * 1000 + deltaMs);
+      return d.toISOString().substring(11, 19);
+    }
+
+    function startClock() {
+      if (timeTicker) clearInterval(timeTicker);
+      timeTicker = setInterval(() => {
+        if (timeBaseEpoch === null || timeBaseClientMs === null || !els.time) return;
+        const delta = Date.now() - timeBaseClientMs;
+        els.time.textContent = formatClock(timeBaseEpoch, delta);
+      }, 1000);
+    }
+
+    function formatUptime(sec) {
+      const s = Number(sec) || 0;
+      const days = Math.floor(s / 86400);
+      const hours = Math.floor((s % 86400) / 3600);
+      const mins = Math.floor((s % 3600) / 60);
+      const secs = Math.floor(s % 60);
+      if (days > 0) return `${days}d ${hours}h ${mins}m`;
+      if (hours > 0) return `${hours}h ${mins}m`;
+      if (mins > 0) return `${mins}m ${secs}s`;
+      return `${secs}s`;
+    }
+
+    function applyStatus(data) {
+      if (!data) return;
+      updateText(els.water, data.water, 'water');
+      if (data.min_level !== undefined && data.max_level !== undefined) {
+        updateText(els.range, `Auto range: ${data.min_level} - ${data.max_level}`, 'range');
+      }
+      updateText(els.pump, data.pump_status, 'pump');
+      if (data.minutes_since_change !== undefined) updateText(els.pumpFoot, `Time since last change: ${data.minutes_since_change} min`, 'pumpFoot');
+      if (data.bad_conn_mode !== undefined) updateText(els.bad, String(data.bad_conn_mode), 'bad');
+      if (data.bad_conn_count !== undefined && data.bad_cancel_fail !== undefined) {
+        updateText(els.badFoot, `Count: ${data.bad_conn_count} | Cancel fail: ${data.bad_cancel_fail}`, 'badFoot');
+      }
+      if (data.time_epoch !== undefined && Number(data.time_epoch) > 0) {
+        timeBaseEpoch = Number(data.time_epoch);
+        timeBaseClientMs = Date.now();
+        if (els.time) els.time.textContent = formatClock(timeBaseEpoch, 0);
+        startClock();
+      } else if (data.time) {
+        updateText(els.time, data.time, 'time');
+      }
+      if (data.is_badtime !== undefined && data.deficient_level !== undefined && data.prefill_from !== undefined && data.prefill_to !== undefined) {
+        updateText(els.timeFoot, `isBadtime: ${data.is_badtime} | Prefill: ${data.prefill_from}:00-${data.prefill_to}:00 (${data.deficient_level})`, 'timeFoot');
+      }
+      if (data.uptime_s !== undefined) updateText(els.uptime, formatUptime(data.uptime_s), 'uptime');
+      if (data.last_command !== undefined) {
+        const cmdAgo = data.last_command_since_s !== undefined ? formatUptime(data.last_command_since_s) : 'n/a';
+        updateText(els.uptimeFoot, `Last command: ${data.last_command} (${cmdAgo} ago)`, 'uptimeFoot');
+      }
+      if (els.headerStatus && data.pump_status) {
+        const headerText = '<span class="dot"></span>' + data.pump_status;
+        if (lastStatus.header !== headerText) {
+          els.headerStatus.innerHTML = headerText;
+          lastStatus.header = headerText;
+        }
+      }
+      if (data.pump_status && lastStatus.pumpStatusClass !== data.pump_status) {
+        updateStatusClass(data.pump_status);
+        lastStatus.pumpStatusClass = data.pump_status;
+      }
+    }
+
+    async function fetchStatus(withToast = false) {
+      try {
+        if (withToast) showToast('refresh', 'Refreshing...');
+        const res = await fetch('/status.json', { cache: 'no-store' });
+        if (!res.ok) throw new Error('Status fetch failed');
+        const data = await res.json();
+        applyStatus(data);
+        if (withToast) showToast('refresh', 'Done');
+      } catch (err) {
+        if (withToast) showToast('refresh', 'Error: ' + err.message);
+      }
+    }
+    const refreshBtn = document.getElementById('refresh-btn');
+    if (refreshBtn) {
+      refreshBtn.addEventListener('click', () => {
+        fetchStatus(true);
+        fetchLogs();
+      });
+    }
+
+    // Initial fetch and periodic polling
+    fetchLogs();
+    setInterval(fetchLogs, 5000); // Poll logs every 5 seconds
+  </script>
+</body>
+</html>
+)HTML";
+
+  return html;
 }
 void set_timer_blink_interval_to(int interval) {
   Serial.println("set_timer_blink_interval_to: " + interval);
   timer_blink.cancel();
   timer_blink.every(interval, blink_f);
+}
+void scheduleNtpFast() {
+  timer_ntp.cancel(ntpTask);
+  ntpTask = timer_ntp.every(5000, ntpFastPoll);
+}
+void scheduleNtpSlow() {
+  timer_ntp.cancel(ntpTask);
+  ntpTask = timer_ntp.every(30000, ntpSlowPoll);
+}
+
+bool ntpFastPoll(void *) {
+  const int nameCount = sizeof(ntpServers) / sizeof(ntpServers[0]);
+  const int ipCount = sizeof(ntpServersIpFallback) / sizeof(ntpServersIpFallback[0]);
+  const int total = nameCount + ipCount;
+  if (total == 0) return true;
+  int idx = ntpAttemptIndex % total;
+  ntpAttemptIndex++;
+  bool ok = false;
+  String server;
+  if (idx < nameCount) {
+    server = String(ntpServers[idx]);
+    ok = syncTimeWithServer(ntpServers[idx], 2, 1500);
+  } else {
+    server = String(ntpServersIpFallback[idx - nameCount]);
+    ok = syncTimeWithServer(ntpServersIpFallback[idx - nameCount], 2, 1500);
+  }
+  if (ok) {
+    scheduleNtpSlow();
+    return false; // stop fast poll; slow poll will continue
+  }
+  logError("NTP fast poll failed: " + server);
+  return true;
+}
+
+bool ntpSlowPoll(void *) {
+  const int nameCount = sizeof(ntpServers) / sizeof(ntpServers[0]);
+  const int ipCount = sizeof(ntpServersIpFallback) / sizeof(ntpServersIpFallback[0]);
+  const int total = nameCount + ipCount;
+  if (total == 0) return true;
+  int idx = ntpAttemptIndex % total;
+  ntpAttemptIndex++;
+  bool ok = false;
+  String server;
+  if (idx < nameCount) {
+    server = String(ntpServers[idx]);
+    ok = syncTimeWithServer(ntpServers[idx], 2, 1500);
+  } else {
+    server = String(ntpServersIpFallback[idx - nameCount]);
+    ok = syncTimeWithServer(ntpServersIpFallback[idx - nameCount], 2, 1500);
+  }
+  return true;
 }
 void loop() {
   timer_1.tick();
@@ -533,8 +1221,9 @@ void loop() {
   timer_relay.tick();
   timer_bad_connection.tick();
   timer_ntp.tick();
-  if ((millis() - last >= (WOOOOOOOOOF * 1000)) && (stop_wdt != true)) {
-    // Serial.println("Resetting WDT...");
+  timer_manual_pump.tick();
+  // Reset watchdog every loop to avoid false triggers when work takes longer.
+  if (!stop_wdt) {
     esp_task_wdt_reset();
     last = millis();
   }
