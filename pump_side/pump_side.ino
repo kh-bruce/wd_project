@@ -37,11 +37,18 @@ auto timer_ntp = timer_create_default(); // 20230808 ntp 時間功能
 auto timer_manual_pump = timer_create_default(); // manual pump auto-stop
 auto timer_events = timer_create_default(); // SSE debounce / pacing
 auto timer_heap = timer_create_default(); // heap monitoring
+auto timer_prefill = timer_create_default(); // prefill time window checks
 
 Timer<>::Task statusPushTask;
+Timer<>::Task prefillTask;
 unsigned long lastStatusSentMs = 0;
 const unsigned long STATUS_DEBOUNCE_MS = 1000; // max 1 push per second
 bool statusPushScheduled = false;
+bool prefillTimerStarted = false;
+const unsigned long PREFILL_CHECK_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+bool isTimeInRange(void *argument /* optional argument given to in/at/every */);
+const int timer_heapcheck_interval = 60 * 60 * 1000; // ms // heap monitoring interval
+
 void set_timer_blink_interval_to(int interval);
 const int normal_blink_interval = 1000; // ms // when normal -> waiting & pump is on
 const int overheated_blink_interval = 250; // ms // when over heat protecting
@@ -49,9 +56,8 @@ const int badconnmode_blink_interval = 50; // ms // when "no conn mode" active
 const int timer_1_delay = (WDT_TIMEOUT + 1) * 1000; // ms // how long after bootup
 const int timer_2_interval = 20 * 60 * 1000; // ms // 多久時間後啟動過熱保護
 const int timer_3_interval = 10 * 60 * 1000; // ms // 過熱保護的停機散熱時間
-const int relay_open_interval = 300; // 控制遙控器點擊的停留時間
+const int relay_open_interval = 200; // 控制遙控器點擊的停留時間
 const int timer_bad_connection_delay = 1 * 60 * 1000; // ms // how long till enter "no conn mode"
-const int timer_heapcheck_interval = 60 * 60 * 1000; // ms // heap monitoring interval
 const long manual_pump_duration_ms = 5 * 60 * 1000; // manual run duration
 float MAX_WATER_LEVEL = 120; // 實測最大值 83 // 2023111月底外部最大壓力測試 122
 float MIN_WATER_LEVEL = 70; // 實測最小值 46
@@ -524,7 +530,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 
     function formatClock(epochSeconds, deltaMs = 0) {
       const d = new Date((Number(epochSeconds) || 0) * 1000 + deltaMs);
-      return d.toISOString().substring(11, 19);
+      return d.toLocaleTimeString('en-GB', { hour12: false, timeZone: 'Asia/Taipei' });
     }
 
     function formatUptime(sec) {
@@ -822,6 +828,13 @@ bool statusDeferred(void *) {
   return false; // one-shot
 }
 
+void goPrefillTimer() {
+  if (prefillTimerStarted) return;
+  timer_prefill.cancel(prefillTask);
+  prefillTask = timer_prefill.every(PREFILL_CHECK_INTERVAL_MS, isTimeInRange);
+  prefillTimerStarted = true;
+}
+
 void scheduleStatusPush() {
   unsigned long now = millis();
   unsigned long elapsed = now - lastStatusSentMs;
@@ -856,7 +869,9 @@ bool syncTimeWithServer(const char* server, int attempts = 4, int delayMs = 2000
       lastTimeSyncMs = millis();
       lastTimeEpoch = timeClient.getEpochTime();
       hasTimeSync = true;
-      logVerbose("NTP sync OK: " + String(server));
+      // Trigger a prefill check right after the first successful sync
+      isTimeInRange(nullptr);
+      goPrefillTimer();
       return true;
     }
     delay(delayMs);
@@ -875,6 +890,16 @@ String formatTimeFromEpoch(unsigned long epoch) {
   char buf[9];
   snprintf(buf, sizeof(buf), "%02d:%02d:%02d", h, m, s);
   return String(buf);
+}
+
+// Get local time (UTC+8) from cached NTP values; returns false if no sync yet.
+bool getLocalTimeFromCache(int &hoursOut, String &formattedOut) {
+  if (lastTimeEpoch == 0 || lastTimeSyncMs == 0) return false;
+  unsigned long nowMs = millis();
+  unsigned long nowEpoch = lastTimeEpoch + ((nowMs - lastTimeSyncMs) / 1000);
+  hoursOut = (nowEpoch % 86400) / 3600;
+  formattedOut = formatTimeFromEpoch(nowEpoch);
+  return true;
 }
 
 bool ntpFastPoll(void *);
@@ -1087,13 +1112,12 @@ bool heapCheck (void *argument /* optional argument given to in/at/every */) {
 }
 // 20230808 ntp 時間功能
 bool isTimeInRange (void *argument /* optional argument given to in/at/every */) {
-  if (timeClient.update() < 0) { // Get the current time from NTP server
-  Serial.println("log for timer7");
-    return true; // Failed to update time
+  int hours = 0;
+  String formattedTime;
+  if (!getLocalTimeFromCache(hours, formattedTime)) {
+    Serial.println("log for timer7 (no time sync yet)");
+    return true; // No time available yet
   }
-  // Extract hours from the formatted time string
-  String formattedTime = timeClient.getFormattedTime();
-  int hours = formattedTime.substring(0, 2).toInt(); // Extract first two characters and convert to integer
   // Check if the time is between 20 and 22
   if (hours >= isTimeInRange_min && hours < isTimeInRange_max) {
     Serial.println("Current time is between 20:00 and 22:00, check_water_level with desiredMinWaterLevel as: " + String(DEFICIENT_WATER_LEVEL) + " (" + formattedTime + ")");
@@ -1104,15 +1128,9 @@ bool isTimeInRange (void *argument /* optional argument given to in/at/every */)
   return true;
 }
 bool isBadTime() {
-  // No time sync yet, cannot determine if it's bad time
-  if (lastTimeEpoch == 0 || lastTimeSyncMs == 0) return false;
-
-  // Calculate current epoch time from cached value
-  unsigned long nowMs = millis();
-  unsigned long nowEpoch = lastTimeEpoch + ((nowMs - lastTimeSyncMs) / 1000);
-
-  // Apply timezone offset (+8 hours = +28800 seconds) and extract hour of day
-  int hours = ((nowEpoch + 28800) % 86400) / 3600;
+  int hours = 0;
+  String tmp;
+  if (!getLocalTimeFromCache(hours, tmp)) return false;
 
   // Check if current hour is in "bad time" range (23:00 - 06:00)
   // isBadTimeBetween_from = 23, isBadTimeBetween_to = 6
@@ -1277,8 +1295,6 @@ void setup() {
   request->send(404, "text/plain", "Not found");
   });
   server.begin();
-
-  timer_ntp.every(timer_ntp_interval, isTimeInRange); // Pre-fill check every 1 min
   timer_heap.every(timer_heapcheck_interval, heapCheck); // Heap monitoring every hour
   set_timer_blink_interval_to(normal_blink_interval);
   // timer_1.in(timer_1_delay, fill_up); // Auto pump start after boot (31 sec) [disabled]
@@ -1322,7 +1338,7 @@ void scheduleNtpFast() {
 }
 void scheduleNtpSlow() {
   timer_ntp.cancel(ntpTask);
-  ntpTask = timer_ntp.every(5 * 60 * 1000, ntpSlowPoll);
+  ntpTask = timer_ntp.every(60 * 60 * 1000, ntpSlowPoll);
 }
 
 bool ntpFastPoll(void *) {
@@ -1378,6 +1394,7 @@ void loop() {
   timer_manual_pump.tick();
   timer_events.tick();
   timer_heap.tick();
+  timer_prefill.tick();
   // Reset watchdog every loop to avoid false triggers when work takes longer.
   if (!stop_wdt) {
     esp_task_wdt_reset();
