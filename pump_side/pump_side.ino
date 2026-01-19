@@ -504,9 +504,6 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     }
 
     let lastStatus = {};
-    let timeBaseEpoch = null;
-    let timeBaseClientMs = null;
-
     function appendLogs(newLogs) {
       if (!Array.isArray(newLogs) || newLogs.length === 0) return;
       allLogs = allLogs.concat(newLogs);
@@ -526,11 +523,6 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       els.headerStatus.classList.remove('on', 'hold');
       if (statusText === 'RUNNING') els.headerStatus.classList.add('on');
       else if (statusText === 'OVERHEAT_PROTECTION') els.headerStatus.classList.add('hold');
-    }
-
-    function formatClock(epochSeconds, deltaMs = 0) {
-      const d = new Date((Number(epochSeconds) || 0) * 1000 + deltaMs);
-      return d.toLocaleTimeString('en-GB', { hour12: false, timeZone: 'Asia/Taipei' });
     }
 
     function formatUptime(sec) {
@@ -561,13 +553,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       if (data.bad_conn_count !== undefined && data.bad_cancel_fail !== undefined) {
         updateText(els.badFoot, `Count: ${data.bad_conn_count} | Cancel fail: ${data.bad_cancel_fail}`, 'badFoot');
       }
-      if (data.time_epoch !== undefined && Number(data.time_epoch) > 0) {
-        timeBaseEpoch = Number(data.time_epoch);
-        timeBaseClientMs = Date.now();
-        if (els.time) els.time.textContent = formatClock(timeBaseEpoch, 0);
-      } else if (data.time) {
-        updateText(els.time, data.time, 'time');
-      }
+      if (data.time) updateText(els.time, data.time, 'time');
       if (data.is_badtime !== undefined && data.deficient_level !== undefined && data.prefill_from !== undefined && data.prefill_to !== undefined) {
         updateText(els.timeFoot, `isBadtime: ${data.is_badtime} | Prefill: ${data.prefill_from}:00-${data.prefill_to}:00 (${data.deficient_level})`, 'timeFoot');
       }
@@ -727,11 +713,8 @@ String makeStatusJson() {
   unsigned long nowMs = millis();
   float minutesSinceChange = (nowMs - ms) / 1000.0 / 60.0;
   int hoursCached = 0;
-  unsigned long epochFromCache = 0;
   String formattedTime = "time not synced";
-  if (getLocalTimeFromCache(hoursCached, formattedTime)) {
-    epochFromCache = lastTimeEpoch + ((nowMs - lastTimeSyncMs) / 1000);
-  }
+  getLocalTimeFromCache(hoursCached, formattedTime);
   String badTimeText = isBadTime() ? "True" : "False";
   unsigned long timeSinceSyncMs = lastTimeSyncMs > 0 ? nowMs - lastTimeSyncMs : 0;
   unsigned long lastCmdSinceMs = lastCommandMs > 0 ? nowMs - lastCommandMs : 0;
@@ -746,8 +729,6 @@ String makeStatusJson() {
   json += "\"bad_conn_count\":" + String(bad_conn_count) + ",";
   json += "\"bad_cancel_fail\":" + String(cannotcanceltimerrrrrr) + ",";
   json += "\"time\":\"" + formattedTime + "\",";
-  json += "\"time_epoch\":" + String(epochFromCache) + ",";
-  json += "\"time_server\":\"" + lastTimeServer + "\",";
   json += "\"time_since_sync_s\":" + String(timeSinceSyncMs / 1000.0, 2) + ",";
   json += "\"is_badtime\":\"" + badTimeText + "\",";
   json += "\"min_level\":" + String(MIN_WATER_LEVEL, 2) + ",";
