@@ -25,6 +25,7 @@ const char *PARAM_INPUT_SETMINLEVEL = "setminlevel";
 const char *PARAM_INPUT_MANUALPUMP = "manualpump";
 const char *PARAM_INPUT_MANUALPUMPSTOP = "manualpumpstop";
 String message = "null";
+unsigned long lastWaterLevelUpdateMs = 0;
 #include <arduino-timer.h>
 auto timer_blink = timer_create_default();
 auto timer_1 = timer_create_default(); // auto start pump when bootup
@@ -354,7 +355,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     </div>
   </div>
   <script>
-    const LOG_BUFFER_SIZE = 128;
+    const LOG_BUFFER_SIZE = 256;
     const actions = {
       up: '/get?frontdoor=up',
       down: '/get?frontdoor=down',
@@ -545,7 +546,11 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       if (!data) return;
       updateText(els.water, data.water, 'water');
       if (data.min_level !== undefined && data.max_level !== undefined) {
-        updateText(els.range, `Auto range: ${data.min_level} - ${data.max_level}`, 'range');
+        let rangeText = `Auto range: ${data.min_level} - ${data.max_level}`;
+        if (data.last_water_update_s !== undefined) {
+          rangeText += ` | Last update: ${formatUptime(data.last_water_update_s)}`;
+        }
+        updateText(els.range, rangeText, 'range');
       }
       updateText(els.pump, data.pump_status, 'pump');
       if (data.minutes_since_change !== undefined) updateText(els.pumpFoot, `Time since last change: ${data.minutes_since_change} min`, 'pumpFoot');
@@ -638,7 +643,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 // - Per entry: 4 (enum) + 4 (ms) + 4 (epoch) + 64 (action) = 76 bytes
 // - Safe allocation: ~5KB -> 64 entries (4,864 bytes total)
 enum LogLevel { LOG_PHYSICAL = 0, LOG_ERROR = 1, LOG_WARNING = 2, LOG_VERBOSE = 3 };
-const int LOG_BUFFER_SIZE = 128;  // Increased buffer size for more logs
+const int LOG_BUFFER_SIZE = 256;  // Increased buffer size for more logs
 const int LOG_ACTION_SIZE = 64;  // Max chars per action message
 void scheduleStatusPush();
 struct LogEntry {
@@ -725,7 +730,7 @@ String makeStatusJson() {
   unsigned long lastCmdSinceMs = lastCommandMs > 0 ? nowMs - lastCommandMs : 0;
 
   String json;
-  json.reserve(800);
+  json.reserve(900);
   json += "{";
   json += "\"water\":\"" + message + "\",";
   json += "\"pump_status\":\"" + pumpStatusText + "\",";
@@ -745,7 +750,8 @@ String makeStatusJson() {
   json += "\"prefill_to\":" + String(isTimeInRange_max) + ",";
   json += "\"uptime_s\":" + String(nowMs / 1000) + ",";
   json += "\"last_command\":\"" + lastCommand + "\",";
-  json += "\"last_command_since_s\":" + String(lastCmdSinceMs / 1000.0, 2);
+  json += "\"last_command_since_s\":" + String(lastCmdSinceMs / 1000.0, 2) + ",";
+  json += "\"last_water_update_s\":" + String((nowMs - lastWaterLevelUpdateMs) / 1000.0, 2);
   json += "}";
   return json;
 }
@@ -1138,8 +1144,8 @@ void setup() {
   pinMode(GPIO4STOP, OUTPUT); //stop
   digitalWrite(GPIO4STOP, HIGH);
 
-  String myip = "192.168.1.217";
-  IPAddress staticIP(192, 168, 1, 217);
+  String myip = "192.168.1.218";
+  IPAddress staticIP(192, 168, 1, 218);
   IPAddress gateway(192, 168, 1, 200);
   IPAddress subnet(255, 255, 255, 0);
   WiFi.config(staticIP, gateway, subnet);
@@ -1206,7 +1212,8 @@ void setup() {
     if (request->hasParam(PARAM_INPUT_WATERLEVEL)) {
       temp = request->getParam(PARAM_INPUT_WATERLEVEL)->value();
       message = temp;
-      record_command("water:" + temp);
+      lastWaterLevelUpdateMs = millis();
+      // record_command("water:" + temp);
     } else if (request->hasParam(PARAM_INPUT_FRONTDOOR)){
       String value = request->getParam(PARAM_INPUT_FRONTDOOR)->value();
       temp = "recived command: frontdoor= " + value;
@@ -1256,27 +1263,28 @@ void setup() {
     scheduleStatusPush();
   });
   // Send a POST request to <IP>/post with a form field message set to <message>
-  server.on("/post", HTTP_POST, [](AsyncWebServerRequest *request) {
-    String message;
-    if (request->hasParam(PARAM_INPUT_WATERLEVEL, true)) {
-      message = request->getParam(PARAM_INPUT_WATERLEVEL, true)->value();
-    } else {
-      message = "No message sent";
-    }
-    Serial.println("\tHello, POST: " + message);
-    request->send(200, "text/plain", "Hello, POST: " + message);
-    check_water_level(MIN_WATER_LEVEL, true);
-    scheduleStatusPush();
-  });
+  // server.on("/post", HTTP_POST, [](AsyncWebServerRequest *request) {
+  //   String message;
+  //   if (request->hasParam(PARAM_INPUT_WATERLEVEL, true)) {
+  //     message = request->getParam(PARAM_INPUT_WATERLEVEL, true)->value();
+  //     lastWaterLevelUpdateMs = millis();
+  //   } else {
+  //     message = "No message sent";
+  //   }
+  //   Serial.println("\tHello, POST: " + message);
+  //   request->send(200, "text/plain", "Hello, POST: " + message);
+  //   check_water_level(MIN_WATER_LEVEL, true);
+  //   scheduleStatusPush();
+  // });
   server.onNotFound([](AsyncWebServerRequest *request){
   request->send(404, "text/plain", "Not found");
   });
   server.begin();
 
   timer_ntp.every(timer_ntp_interval, isTimeInRange); // Pre-fill check every 1 min
-  timer_heap.every(10 * 1000, heapCheck); // Heap monitoring every 60 seconds
+  timer_heap.every(60 * 60 * 1000, heapCheck); // Heap monitoring every hour
   set_timer_blink_interval_to(normal_blink_interval);
-  timer_1.in(timer_1_delay, fill_up); // Auto pump start after boot (31 sec)
+  // timer_1.in(timer_1_delay, fill_up); // Auto pump start after boot (31 sec) [disabled]
   reset_bad_conn_timer(); // timer_bad_connection
 
   bool ntpSuccess = false;
