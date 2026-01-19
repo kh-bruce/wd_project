@@ -726,8 +726,12 @@ String makeStatusJson() {
   }
   unsigned long nowMs = millis();
   float minutesSinceChange = (nowMs - ms) / 1000.0 / 60.0;
-  unsigned long epochFromCache = lastTimeEpoch > 0 ? lastTimeEpoch + ((nowMs - lastTimeSyncMs) / 1000) : 0;
-  String formattedTime = formatTimeFromEpoch(epochFromCache);
+  int hoursCached = 0;
+  unsigned long epochFromCache = 0;
+  String formattedTime = "time not synced";
+  if (getLocalTimeFromCache(hoursCached, formattedTime)) {
+    epochFromCache = lastTimeEpoch + ((nowMs - lastTimeSyncMs) / 1000);
+  }
   String badTimeText = isBadTime() ? "True" : "False";
   unsigned long timeSinceSyncMs = lastTimeSyncMs > 0 ? nowMs - lastTimeSyncMs : 0;
   unsigned long lastCmdSinceMs = lastCommandMs > 0 ? nowMs - lastCommandMs : 0;
