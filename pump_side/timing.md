@@ -64,7 +64,7 @@ This document lists **all scheduled and timed tasks** in the ESP32 water project
 ## 4. Bad Connection Detection
 
 ### Bad Connection Mode (go_bad_conn_mode)
-- **Interval:** Once, after 1 minute (if not reset)
+- **Interval:** Once, after 80 seconds (if not reset)
 - **Setup:** `timer_bad_connection.in(timer_bad_connection_delay, go_bad_conn_mode)`
 - **Purpose:**
   - If the system does not receive expected updates, enters "bad connection mode" and forces the pump to stop for safety.
