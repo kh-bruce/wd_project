@@ -56,8 +56,8 @@ void setup(){
   
   timer.setInterval(3000, myTimerEvent);
   timer.setInterval(100, reset_wdt);
-  timer.setInterval(2, collectDate);
-  timer.setInterval(3000, sendData);
+  timer.setInterval(1, collectDate);
+  timer.setInterval(1000, sendData);
 }
 
 // This function is called every time the device is connected to the Blynk.Cloud
@@ -167,12 +167,12 @@ void setMinLevel(int v){
 }
 
 bool sendHttpGet(String url) {
-    http.setTimeout(100);
+    http.setTimeout(1000);
     http.begin(url);
     int httpResponseCode = http.GET();
+    String response = http.getString(); // 讀取回應的內容至字串
 
     if (httpResponseCode == 200) {
-      String response = http.getString(); // 讀取回應的內容至字串
       Serial.print("httpResponseCode = 200, response: ");
       Serial.println(response);
       return true;
@@ -230,17 +230,17 @@ void sendData(){
     if (avg_max < avg) avg_max = avg;
     if (avg_min > avg) avg_min = avg;
 
+    //http GET send to 1f motor esp32
+    String url = "http://" + myip + "/get?message=" + String(avg, 4);
+    Serial.printf("sendData: %lf, max: %lf, min: %lf\n", avg, avg_max, avg_min);
+    bool result = sendHttpGet(url);
+
+    needUpdate = false;
+
+    Blynk.virtualWrite(V3, result ? 1 : 0);
     Blynk.virtualWrite(V10, avg);
     Blynk.virtualWrite(V11, avg_max);
     Blynk.virtualWrite(V12, avg_min);
-    Serial.printf("sendData: %lf, max: %lf, min: %lf\n", avg, avg_max, avg_min);
-
-    //http GET send to 1f motor esp32
-    String url = "http://" + myip + "/get?message=" + String(avg, 4);
-    bool result = sendHttpGet(url);
-    Blynk.virtualWrite(V3, result ? 1 : 0);
-
-    needUpdate = false;
   }
 }
 
