@@ -54,10 +54,10 @@ void setup(){
   //Blynk.begin(BLYNK_AUTH_TOKEN, ssid, pass, "blynk.cloud", 80);
   //Blynk.begin(BLYNK_AUTH_TOKEN, ssid, pass, IPAddress(192,168,1,100), 8080);
   
-  timer.setInterval(1000, myTimerEvent);
+  timer.setInterval(3000, myTimerEvent);
   timer.setInterval(100, reset_wdt);
   timer.setInterval(2, collectDate);
-  timer.setInterval(1000, sendData);
+  timer.setInterval(3000, sendData);
 }
 
 // This function is called every time the device is connected to the Blynk.Cloud
