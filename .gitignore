@@ -1,0 +1,15 @@
+# --- ESP32 firmware secrets (per-sketch) ---
+# Real credentials live in arduino_secrets.h; only the *.example.h templates are committed.
+*/arduino_secrets.h
+!*/arduino_secrets.example.h
+tower_side_ai/arduino_secrets.h
+pump_side_ai/arduino_secrets.h
+
+# --- Mosquitto broker runtime state ---
+deploy/mosquitto/config/passwd
+deploy/mosquitto/data/
+deploy/mosquitto/log/
+
+# --- Home Assistant config volume (generated at runtime, contains secrets) ---
+deploy/homeassistant/*
+!deploy/homeassistant/.gitkeep

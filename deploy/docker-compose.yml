@@ -1,0 +1,27 @@
+services:
+  mosquitto:
+    image: eclipse-mosquitto:2
+    container_name: wd-mosquitto
+    restart: unless-stopped
+    ports:
+      - "1883:1883"   # MQTT (plain, LAN) - ESP32 boards connect here
+      - "9001:9001"   # MQTT over WebSockets (optional, handy for browser MQTT clients)
+    volumes:
+      - ./mosquitto/config:/mosquitto/config
+      - ./mosquitto/data:/mosquitto/data
+      - ./mosquitto/log:/mosquitto/log
+
+  homeassistant:
+    image: homeassistant/home-assistant:2024.6
+    container_name: wd-homeassistant
+    restart: unless-stopped
+    depends_on:
+      - mosquitto
+    volumes:
+      - ./homeassistant:/config
+      - /etc/localtime:/etc/localtime:ro
+    # host networking lets HA discover/announce on your LAN (recommended for HA).
+    # HA reaches the broker at the host's address on port 1883.
+    network_mode: host
+    environment:
+      - TZ=Asia/Taipei
