@@ -46,12 +46,22 @@ float depth[DEPTH_COUNT] = {};
 int   depth_index = 0;
 float avg_max = 0.0;
 float avg_min = 401.0;
-bool  needUpdate = false;
 bool  over1loop = false;
+bool  haveReading = false;   // true once at least one batch has produced a value
 
 float temp = 0;
-#define TIMES2AVG 5000 // 取幾次做平均
+// 每湊滿這麼多次 analogRead 就產生一個新的批次平均值。
+// 從 5000 大幅降低：arduino-timer 每次 loop() 最多只跑 collectDate 一次，
+// 所以實際取樣率 = loop() 迭代率。批次越小，即使 WiFi/MQTT 偶爾阻塞拖慢
+// loop()，也能每 1~2 秒就備好一個新的水位值，發佈才不會被餓死。
+#define TIMES2AVG 300
 int   sampleCount = 0;
+
+// 解耦「發佈」與「湊滿一批取樣」：sendData 每秒都會發佈 smoothedLevel，
+// 不再等 needUpdate。smoothedLevel 是對「9-slot 視窗平均」再做一層 EMA，
+// 額外增加平滑度。alpha 越小越平滑、反應越慢。
+float smoothedLevel = 0.0;
+#define EMA_ALPHA 0.30f
 
 // ---- Timers (replaces BlynkTimer) ----
 auto timer_sensor = timer_create_default(); // collectDate, every 2ms
@@ -134,9 +144,17 @@ bool mqttReconnect() {
   Serial.print(":");
   Serial.println(SECRET_MQTT_PORT);
 
+  // mqtt.connect() 會阻塞（TCP 連線 + 等 CONNACK，可達數秒）。在阻塞前後各餵一次
+  // 看門狗，避免連續失敗的重連嘗試把 25s WDT 視窗吃滿。
+  esp_task_wdt_reset();
+  lastWdtReset = millis();
+
   // LWT: broker publishes "offline" (retained) if we drop uncleanly.
   bool ok = mqtt.connect(SECRET_MQTT_CLIENTID, SECRET_MQTT_USER, SECRET_MQTT_PASS,
                          TOPIC_AVAIL, 1, true, "offline");
+
+  esp_task_wdt_reset();
+  lastWdtReset = millis();
   if (ok) {
     Serial.println("MQTT connected");
     mqtt.publish(TOPIC_AVAIL, "online", true);
@@ -166,37 +184,42 @@ bool collectDate(void*) {
     } else {
       depth_index++;
     }
-    needUpdate = true;
+
+    // 對 9-slot 視窗求平均，再餵進 EMA 多平滑一層。
+    double sum = 0;
+    int n = over1loop ? DEPTH_COUNT : depth_index;
+    if (n <= 0) n = 1;
+    for (int i = 0; i < n; i++) sum += depth[i];
+    float windowAvg = (float)(sum / n);
+
+    if (!haveReading) {
+      smoothedLevel = windowAvg;   // 第一筆直接帶入，避免從 0 慢慢爬上來
+      haveReading = true;
+    } else {
+      smoothedLevel = EMA_ALPHA * windowAvg + (1.0f - EMA_ALPHA) * smoothedLevel;
+    }
+
+    if (avg_max < smoothedLevel) avg_max = smoothedLevel;
+    if (avg_min > smoothedLevel) avg_min = smoothedLevel;
   }
   return true; // repeat
 }
 
 bool sendData(void*) {
-  if (!needUpdate) return true;
-
-  double sum = 0, avg = 0;
-  if (over1loop) {
-    for (int i = 0; i < DEPTH_COUNT; i++) sum += depth[i];
-    avg = sum / DEPTH_COUNT;
-  } else {
-    for (int i = 0; i < depth_index; i++) sum += depth[i];
-    avg = (depth_index > 0) ? sum / depth_index : 0;
-  }
-
-  if (avg_max < avg) avg_max = avg;
-  if (avg_min > avg) avg_min = avg;
-
-  needUpdate = false;
+  // 一律發佈目前最新的平滑水位（不再等湊滿一整批 5000 取樣）。
+  // 只要還沒有任何讀值就先跳過，避免在開機初期送出 0。
+  if (!haveReading) return true;
 
   // Publish the live water level to MQTT (retain=false — the pump's 60s failsafe
   // relies on NOT receiving stale retained values on reconnect).
+  // 水位輸出精確到小數點下一位。
   bool ok = false;
   if (mqtt.connected()) {
-    ok = publishFloat(TOPIC_WATER, (float)avg, 4, false);
-    publishFloat(TOPIC_AVG_MAX, avg_max, 4, true);
-    publishFloat(TOPIC_AVG_MIN, avg_min, 4, true);
+    ok = publishFloat(TOPIC_WATER, smoothedLevel, 1, false);
+    publishFloat(TOPIC_AVG_MAX, avg_max, 1, true);
+    publishFloat(TOPIC_AVG_MIN, avg_min, 1, true);
   }
-  Serial.printf("sendData: %.4f, max: %.4f, min: %.4f (mqtt pub=%d)\n", avg, avg_max, avg_min, ok);
+  Serial.printf("sendData: %.1f, max: %.1f, min: %.1f (mqtt pub=%d)\n", smoothedLevel, avg_max, avg_min, ok);
   return true; // repeat
 }
 
@@ -224,6 +247,8 @@ void setup() {
   lastWdtReset = millis();
 
   WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);   // 讓 WiFi 斷線時自動於背景重連，縮短每次卡住的時間
+  WiFi.persistent(false);
   Serial.print("Connecting to WiFi SSID: ");
   Serial.println(ssid);
   WiFi.begin(ssid, pass);
@@ -241,9 +266,15 @@ void setup() {
     Serial.println("WiFi connect failed (will keep retrying in loop)");
   }
 
+  // PubSubClient 不會限制底層 TCP connect 的逾時（ESP32 預設 ~3s 無上限保護），
+  // 所以直接在 WiFiClient 上設逾時，弱訊號時 connect 阻塞才不會拖長。
+  espClient.setTimeout(2000); // ms
+
   mqtt.setServer(SECRET_MQTT_HOST, SECRET_MQTT_PORT);
   mqtt.setBufferSize(512);
-  mqtt.setSocketTimeout(5);
+  // socketTimeout 主要影響接收路徑（等 CONNACK / 讀封包）。從 5s 降到 2s，
+  // 弱訊號時每次連線失敗的阻塞時間更短，避免多次重連疊加成 40~80s 的空窗。
+  mqtt.setSocketTimeout(2);
   mqtt.setKeepAlive(15);
   mqttReconnect();
 
