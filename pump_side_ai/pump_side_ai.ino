@@ -40,6 +40,13 @@ PubSubClient mqtt(mqttWifiClient);
 unsigned long lastMqttReconnectAttempt = 0;
 const unsigned long MQTT_RECONNECT_INTERVAL_MS = 5000;
 bool wasMqttConnected = false;
+
+// ---- WiFi (non-blocking connect + auto-reconnect) ----
+unsigned long lastWifiAttempt = 0;
+const unsigned long WIFI_RETRY_INTERVAL_MS = 10000; // re-issue WiFi.begin() every 10s while down
+bool wifiWasConnected = false;
+void wifiBegin();        // (re)issue a connection attempt — non-blocking
+void serviceWifi();      // called from loop(): reconnect if dropped
 // Discovery is published once per (re)connect. Set to 0 to use manual HA YAML instead.
 #define USE_HA_DISCOVERY 1
 
@@ -1393,6 +1400,59 @@ bool publishStatusMqtt(void*) {
   return true; // repeat
 }
 
+// (Re)issue a WiFi connection attempt. Heavy one-time setup (mode + static IP +
+// auto-reconnect) runs ONCE; subsequent retries just re-issue WiFi.begin() to
+// re-associate WITHOUT powering the radio off — so we don't fight the SDK's own
+// auto-reconnect, don't tear down the netif (keeps AsyncWebServer stable), and
+// don't thrash. Each call returns quickly (no radio off/on cycle on retries).
+void wifiBegin() {
+  static bool configured = false;
+  if (!configured) {
+    IPAddress staticIP(192, 168, 1, 217);
+    IPAddress gateway(192, 168, 1, 200);
+    IPAddress subnet(255, 255, 255, 0);
+    IPAddress dns(192, 168, 1, 200);
+    WiFi.persistent(false);        // don't wear flash writing creds every boot
+    WiFi.mode(WIFI_STA);
+    WiFi.setAutoReconnect(true);   // SDK re-associates on its own too
+    WiFi.config(staticIP, gateway, subnet, dns); // static IP sticks across reconnects
+    configured = true;
+  }
+  Serial.print("Connecting to WiFi SSID: ");
+  Serial.println(ssid);
+  WiFi.begin(ssid, password);      // re-associate; radio stays up
+  lastWifiAttempt = millis();
+}
+
+// Called every loop(): if WiFi is down, re-issue WiFi.begin() periodically
+// (non-blocking). Logs transitions. Never blocks, so the watchdog + timers
+// keep running and the bad-connection failsafe still trips if data stops.
+void serviceWifi() {
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!wifiWasConnected) {
+      wifiWasConnected = true;
+      Serial.print("WiFi connected, IP: ");
+      Serial.println(WiFi.localIP());
+      logVerbose("WiFi connected: " + WiFi.localIP().toString());
+    }
+    return;
+  }
+  // Not connected
+  if (wifiWasConnected) {
+    wifiWasConnected = false;
+    Serial.println("WiFi lost — will keep retrying");
+    logWarning("WiFi disconnected");
+  }
+  // Let the SDK's own auto-reconnect work; only re-issue WiFi.begin() manually if
+  // we've been stuck for a while AND aren't already mid-association (avoid
+  // stomping an in-flight attempt — WL_IDLE_STATUS means connecting/idle).
+  if (millis() - lastWifiAttempt >= WIFI_RETRY_INTERVAL_MS &&
+      WiFi.status() != WL_IDLE_STATUS) {
+    Serial.println("Retrying WiFi.begin()...");
+    wifiBegin();
+  }
+}
+
 void setup() {
   Serial.begin(115200);
   Serial.println("Configuring WDT...");
@@ -1410,34 +1470,26 @@ void setup() {
   pinMode(GPIO4STOP, OUTPUT); //stop
   digitalWrite(GPIO4STOP, HIGH);
 
-  String myip = "192.168.1.217";
-  IPAddress staticIP(192, 168, 1, 217);
-  IPAddress gateway(192, 168, 1, 200);
-  IPAddress subnet(255, 255, 255, 0);
-  WiFi.config(staticIP, gateway, subnet);
-  WiFi.mode(WIFI_STA);
-  Serial.print("Connecting to WiFi SSID: ");
-  Serial.println(ssid);
-  WiFi.begin(ssid, password);
+  // Kick off WiFi (non-blocking helper). Wait a short while so a normal boot
+  // brings up the web server/MQTT with WiFi already up — but DO NOT bail if it
+  // doesn't connect: serviceWifi() in loop() keeps retrying so the board can
+  // recover on its own instead of locking up (the old code returned here).
+  wifiBegin();
   unsigned long wifiStart = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < 30000) {
-    delay(500);
+  while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < 15000) {
+    delay(250);
     if (!stop_wdt) esp_task_wdt_reset();
   }
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.printf("ERROR! >> WiFi Failed!");
-    // Disable auto-restart to avoid reboot loops; stay alive for troubleshooting.
-    return;
-  }
-  Serial.print("IP Address: ");
-  Serial.println(WiFi.localIP());
-  Serial.print("MAC: ");
-  Serial.println(WiFi.macAddress());
-  logVerbose("WiFi connected: " + WiFi.localIP().toString());
-  if (WiFi.localIP().toString().equals(myip) == false) {
-    Serial.println("ERROR! >> WRONG IP Address, please check Router's setting (now ip:" + WiFi.localIP().toString() + ")");
-    // Disable auto-restart to avoid reboot loops; stay alive for troubleshooting.
-    return;
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiWasConnected = true;
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.localIP());
+    Serial.print("MAC: ");
+    Serial.println(WiFi.macAddress());
+    logVerbose("WiFi connected: " + WiFi.localIP().toString());
+  } else {
+    Serial.println("WiFi not up yet — continuing; loop() will keep retrying");
+    logWarning("WiFi not connected at boot (will retry)");
   }
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
     request->send_P(200, "text/html", INDEX_HTML);
@@ -1633,6 +1685,9 @@ bool ntpSlowPoll(void *) {
   return true;
 }
 void loop() {
+  // Keep WiFi alive (non-blocking): reconnect if it dropped or never came up.
+  serviceWifi();
+
   // MQTT serviced on the loop thread (one non-blocking reconnect attempt / 5s).
   if (WiFi.status() == WL_CONNECTED) {
     if (!mqtt.connected()) {
