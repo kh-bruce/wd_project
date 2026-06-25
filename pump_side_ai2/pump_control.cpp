@@ -1,0 +1,232 @@
+#include "pump_control.h"
+#include "config.h"
+#include "logging.h"
+#include "ntp_time.h"
+#include "failsafe.h"
+#include <Preferences.h>
+#include <arduino-timer.h>
+
+// ---- State (loop thread only) ----
+PumpStatus    pump_status = STOPPED;
+unsigned long pumpStatusChangedMs = 0;
+unsigned long pumpOnSinceMs = 0;
+
+float MAX_WATER_LEVEL = cfg::DEFAULT_MAX_LEVEL;
+float MIN_WATER_LEVEL = cfg::DEFAULT_MIN_LEVEL;
+float DEFICIENT_WATER_LEVEL = cfg::DEFAULT_MIN_LEVEL;
+
+String        lastCommand = "none";
+unsigned long lastCommandMs = 0;
+
+static Preferences prefs;
+
+// Timers (ticked from pumpTick(), i.e. loop thread)
+static auto timer_overheatTrip    = timer_create_default(); // run -> overheat after OVERHEAT_TRIP_MS
+static auto timer_overheatRecover = timer_create_default(); // overheat -> recover after OVERHEAT_RECOVER_MS
+static auto timer_manualPump      = timer_create_default(); // manual auto-stop
+static auto timer_blink           = timer_create_default();
+
+static bool blinkState = true;
+
+const char* pumpStatusStr() {
+  switch (pump_status) {
+    case RUNNING:             return "RUNNING";
+    case STOPPED:             return "STOPPED";
+    case OVERHEAT_PROTECTION: return "OVERHEAT_PROTECTION";
+    default:                  return "Unknown";
+  }
+}
+
+void record_command(const String &name) {
+  lastCommand = name;
+  lastCommandMs = millis();
+  logVerbose("Command: " + name);
+}
+
+// ---- Blink ----
+static bool blink_cb(void *) {
+  blinkState = !blinkState;
+  digitalWrite(cfg::PIN_STATUS_LED, blinkState ? HIGH : LOW);
+  return true;
+}
+void setBlinkInterval(int intervalMs) {
+  timer_blink.cancel();
+  timer_blink.every(intervalMs, blink_cb);
+}
+void blinkTick() { timer_blink.tick(); }
+
+static void recomputeDeficientLevel() {
+  DEFICIENT_WATER_LEVEL = (MAX_WATER_LEVEL - MIN_WATER_LEVEL) * cfg::PREFILL_FRACTION + MIN_WATER_LEVEL;
+}
+
+void applySetMax(float f) {
+  if (f > MIN_WATER_LEVEL) {
+    MAX_WATER_LEVEL = f;
+    recomputeDeficientLevel();
+    prefs.putFloat("max", MAX_WATER_LEVEL); // persist to NVS
+    logWarning("Max level set to " + String(MAX_WATER_LEVEL, 1));
+  } else {
+    logWarning("Max level rejected (must > min " + String(MIN_WATER_LEVEL, 1) + ")");
+  }
+}
+void applySetMin(float f) {
+  if (f < MAX_WATER_LEVEL) {
+    MIN_WATER_LEVEL = f;
+    recomputeDeficientLevel();
+    prefs.putFloat("min", MIN_WATER_LEVEL);
+    logWarning("Min level set to " + String(MIN_WATER_LEVEL, 1));
+  } else {
+    logWarning("Min level rejected (must < max " + String(MAX_WATER_LEVEL, 1) + ")");
+  }
+}
+
+// ---- Pump primitives (atomic on the loop thread) ----
+static bool overheatTrip_cb(void *) {
+  logWarning("Pump overheat protection triggered");
+  request_pump_to(OVERHEAT_PROTECTION);
+  return false; // one-shot
+}
+static bool overheatRecover_cb(void *);
+
+void pump_run() {
+  if (digitalRead(cfg::PIN_PUMP_RELAY) == cfg::RELAY_ON) return; // already on
+  timer_overheatTrip.cancel();
+  digitalWrite(cfg::PIN_PUMP_RELAY, cfg::RELAY_ON);
+  pump_status = RUNNING;
+  pumpStatusChangedMs = millis();
+  pumpOnSinceMs = millis();
+  logPhysical("Pump relay ON");
+  timer_overheatTrip.in(cfg::OVERHEAT_TRIP_MS, overheatTrip_cb);
+}
+
+void pump_stop() {
+  // During overheat cooldown the relay is already OFF and timer_overheatRecover
+  // is counting down the thermal protection. A force-stop (failsafe trip or
+  // manual stop) must NOT cancel that cooldown or flip the state to STOPPED,
+  // or the motor could be restarted hot. Leave OVERHEAT_PROTECTION intact.
+  if (pump_status == OVERHEAT_PROTECTION) {
+    timer_manualPump.cancel();
+    return;
+  }
+  if (digitalRead(cfg::PIN_PUMP_RELAY) == cfg::RELAY_OFF) return; // already off
+  timer_overheatTrip.cancel();
+  timer_manualPump.cancel(); // a manual run is moot once stopped
+  digitalWrite(cfg::PIN_PUMP_RELAY, cfg::RELAY_OFF);
+  pump_status = STOPPED;
+  pumpStatusChangedMs = millis();
+  pumpOnSinceMs = 0;
+  logPhysical("Pump relay OFF");
+}
+
+void pump_overheat_protect() {
+  timer_overheatRecover.cancel();
+  timer_manualPump.cancel(); // don't let a stale manual-stop abort cooldown
+  setBlinkInterval(cfg::BLINK_OVERHEAT_MS);
+  digitalWrite(cfg::PIN_PUMP_RELAY, cfg::RELAY_OFF);
+  pump_status = OVERHEAT_PROTECTION;
+  pumpStatusChangedMs = millis();
+  pumpOnSinceMs = 0;
+  logPhysical("Pump forced OFF (overheat protection)");
+  timer_overheatRecover.in(cfg::OVERHEAT_RECOVER_MS, overheatRecover_cb);
+}
+
+static bool overheatRecover_cb(void *) {
+  extern bool bad_conn_mode;
+  // Don't override the fast bad-conn blink if the failsafe is latched.
+  if (!bad_conn_mode) setBlinkInterval(cfg::BLINK_NORMAL_MS);
+  logVerbose("Recovered from overheat protection");
+  pump_status = STOPPED;
+  pumpStatusChangedMs = millis();
+  pumpOnSinceMs = 0;
+  // Re-evaluate the CURRENT water level rather than blindly restarting.
+  if (!isBadTime()) check_water_level(MIN_WATER_LEVEL);
+  return false; // one-shot
+}
+
+static bool manualStop_cb(void *) {
+  logVerbose("Manual pump timer expired - stopping");
+  pump_stop();
+  return false; // one-shot
+}
+
+void manual_pump_start() {
+  logPhysical("Manual pump started (5 min)");
+  timer_manualPump.cancel();
+  request_pump_to(RUNNING);
+  timer_manualPump.in(cfg::MANUAL_PUMP_MS, manualStop_cb);
+}
+
+void manual_pump_stop() {
+  logWarning("Manual pump stop requested");
+  timer_manualPump.cancel();
+  request_pump_to(STOPPED);
+}
+
+void request_pump_to(PumpStatus status) {
+  if (bad_conn_mode) return; // failsafe latched: refuse to run
+  switch (status) {
+    case RUNNING:
+      if (pump_status == STOPPED) pump_run();
+      // ignore if already RUNNING or in OVERHEAT_PROTECTION
+      break;
+    case STOPPED:
+      pump_stop();
+      break;
+    case OVERHEAT_PROTECTION:
+      if (pump_status != OVERHEAT_PROTECTION) pump_overheat_protect();
+      break;
+    default: break;
+  }
+}
+
+void check_water_level(float desiredMinWaterLevel) {
+  // latestWater is parsed at ingress. Treat a 0 (or invalid) reading as "no
+  // usable data" and take NO pump action — matching the original semantics
+  // (message.toFloat() != 0). Liveness/failsafe is handled separately by
+  // recordWater(), which resets on ANY message including 0. So a 0 reading
+  // still proves the link is alive but never drives the pump.
+  float num = latestWater;
+  if (!latestWaterValid || num == 0.0f) {
+    Serial.println("[check_water_level] no usable water data (0/invalid) — no action");
+    return;
+  }
+  Serial.printf("[check_water_level] %.2f (min %.1f max %.1f)\n",
+                num, desiredMinWaterLevel, MAX_WATER_LEVEL);
+  if (num < desiredMinWaterLevel) {
+    logWarning("Water BELOW min (" + String(num, 1) + " < " + String(desiredMinWaterLevel, 1) + ")");
+    request_pump_to(RUNNING);
+  } else if (num > MAX_WATER_LEVEL) {
+    logVerbose("Water OVER max (" + String(num, 1) + " > " + String(MAX_WATER_LEVEL, 1) + ")");
+    request_pump_to(STOPPED);
+  }
+}
+
+void pumpInit() {
+  pinMode(cfg::PIN_STATUS_LED, OUTPUT);
+  digitalWrite(cfg::PIN_STATUS_LED, HIGH);
+  pinMode(cfg::PIN_PUMP_RELAY, OUTPUT);
+  digitalWrite(cfg::PIN_PUMP_RELAY, cfg::RELAY_OFF);
+
+  // Load thresholds from NVS (fall back to defaults).
+  prefs.begin("wdpump", false);
+  MAX_WATER_LEVEL = prefs.getFloat("max", cfg::DEFAULT_MAX_LEVEL);
+  MIN_WATER_LEVEL = prefs.getFloat("min", cfg::DEFAULT_MIN_LEVEL);
+  recomputeDeficientLevel();
+  Serial.printf("Thresholds loaded: max=%.1f min=%.1f deficient=%.1f\n",
+                MAX_WATER_LEVEL, MIN_WATER_LEVEL, DEFICIENT_WATER_LEVEL);
+
+  setBlinkInterval(cfg::BLINK_NORMAL_MS);
+}
+
+void pumpTick() {
+  timer_overheatTrip.tick();
+  timer_overheatRecover.tick();
+  timer_manualPump.tick();
+
+  // Absolute max-on hard cap (defense in depth, independent of overheat timer).
+  if (pump_status == RUNNING && pumpOnSinceMs != 0 &&
+      millis() - pumpOnSinceMs > cfg::PUMP_MAX_ON_MS) {
+    logError("Pump exceeded absolute max-on time — forcing OFF");
+    pump_stop();
+  }
+}
