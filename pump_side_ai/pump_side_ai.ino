@@ -1416,6 +1416,8 @@ void setup() {
   IPAddress subnet(255, 255, 255, 0);
   WiFi.config(staticIP, gateway, subnet);
   WiFi.mode(WIFI_STA);
+  Serial.print("Connecting to WiFi SSID: ");
+  Serial.println(ssid);
   WiFi.begin(ssid, password);
   unsigned long wifiStart = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < 30000) {

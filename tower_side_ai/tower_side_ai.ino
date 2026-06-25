@@ -176,6 +176,8 @@ void setup() {
   lastWdtReset = millis();
 
   WiFi.mode(WIFI_STA);
+  Serial.print("Connecting to WiFi SSID: ");
+  Serial.println(ssid);
   WiFi.begin(ssid, pass);
   unsigned long wifiStart = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < 30000) {
