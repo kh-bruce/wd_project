@@ -3,6 +3,7 @@
 #include "logging.h"
 #include "ntp_time.h"
 #include "failsafe.h"
+#include "commands.h"   // latestWater / latestWaterValid (water ingress)
 #include <Preferences.h>
 #include <arduino-timer.h>
 

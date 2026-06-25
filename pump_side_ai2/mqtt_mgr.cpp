@@ -56,7 +56,9 @@ static void mqttCallback(char* topic, byte* payload, unsigned int len) {
 
 // ---- Status JSON (ArduinoJson -> fixed buffer) ----
 size_t buildStatusJson(char *buf, size_t buflen) {
-  JsonDocument doc; // ArduinoJson v7 (elastic; replaces StaticJsonDocument)
+  // ArduinoJson v6: StaticJsonDocument (stack). If you upgrade to v7, change
+  // this to `JsonDocument doc;` (StaticJsonDocument is removed in v7).
+  StaticJsonDocument<512> doc;
   unsigned long nowMs = millis();
 
   doc["water"]        = latestWaterValid ? latestWater : 0.0f;
