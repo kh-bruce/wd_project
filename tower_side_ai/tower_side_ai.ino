@@ -77,6 +77,53 @@ bool publishFloat(const char* topic, float value, int decimals, bool retain) {
   return mqtt.publish(topic, buf, retain);
 }
 
+// Publish HA MQTT Discovery configs (retained) so the tower's entities
+// auto-appear in Home Assistant grouped under one "WD Tower (4F)" device.
+// Built with snprintf into a reused buffer to keep heap pressure low.
+// Set USE_HA_DISCOVERY to 0 to define these entities manually in HA YAML instead.
+#define USE_HA_DISCOVERY 1
+#if USE_HA_DISCOVERY
+void publishDiscovery() {
+  const char* DEV = "\"dev\":{\"ids\":[\"wd_tower\"],\"name\":\"WD Tower (4F)\",\"mdl\":\"ESP32\",\"mf\":\"wd_project\"}";
+  const char* AV  = "\"avty_t\":\"wd/tower/avail\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\"";
+  char buf[480];
+
+  snprintf(buf, sizeof(buf),
+    "{\"name\":\"Water Level\",\"uniq_id\":\"wd_tower_water\",\"stat_t\":\"%s\","
+    "\"stat_cla\":\"measurement\",\"ic\":\"mdi:waves-arrow-up\",\"exp_aft\":90,%s,%s}",
+    TOPIC_WATER, AV, DEV);
+  mqtt.publish("homeassistant/sensor/wd_tower/water/config", buf, true);
+
+  snprintf(buf, sizeof(buf),
+    "{\"name\":\"Water Avg Max\",\"uniq_id\":\"wd_tower_avg_max\",\"stat_t\":\"%s\","
+    "\"ic\":\"mdi:arrow-collapse-up\",\"ent_cat\":\"diagnostic\",%s,%s}",
+    TOPIC_AVG_MAX, AV, DEV);
+  mqtt.publish("homeassistant/sensor/wd_tower/avg_max/config", buf, true);
+
+  snprintf(buf, sizeof(buf),
+    "{\"name\":\"Water Avg Min\",\"uniq_id\":\"wd_tower_avg_min\",\"stat_t\":\"%s\","
+    "\"ic\":\"mdi:arrow-collapse-down\",\"ent_cat\":\"diagnostic\",%s,%s}",
+    TOPIC_AVG_MIN, AV, DEV);
+  mqtt.publish("homeassistant/sensor/wd_tower/avg_min/config", buf, true);
+
+  snprintf(buf, sizeof(buf),
+    "{\"name\":\"Uptime\",\"uniq_id\":\"wd_tower_uptime\",\"stat_t\":\"%s\","
+    "\"unit_of_meas\":\"s\",\"dev_cla\":\"duration\",\"stat_cla\":\"total_increasing\","
+    "\"ent_cat\":\"diagnostic\",%s,%s}",
+    TOPIC_UPTIME, AV, DEV);
+  mqtt.publish("homeassistant/sensor/wd_tower/uptime/config", buf, true);
+
+  snprintf(buf, sizeof(buf),
+    "{\"name\":\"WiFi Signal\",\"uniq_id\":\"wd_tower_rssi\",\"stat_t\":\"%s\","
+    "\"unit_of_meas\":\"dBm\",\"dev_cla\":\"signal_strength\",\"stat_cla\":\"measurement\","
+    "\"ent_cat\":\"diagnostic\",%s,%s}",
+    TOPIC_RSSI, AV, DEV);
+  mqtt.publish("homeassistant/sensor/wd_tower/rssi/config", buf, true);
+}
+#else
+void publishDiscovery() {}
+#endif
+
 bool mqttReconnect() {
   // One non-blocking attempt per interval (must stay well under WDT_TIMEOUT).
   if (millis() - lastMqttReconnectAttempt < MQTT_RECONNECT_INTERVAL_MS) return false;
@@ -93,6 +140,7 @@ bool mqttReconnect() {
   if (ok) {
     Serial.println("MQTT connected");
     mqtt.publish(TOPIC_AVAIL, "online", true);
+    publishDiscovery();
   } else {
     Serial.print("MQTT connect failed, state=");
     Serial.println(mqtt.state());
