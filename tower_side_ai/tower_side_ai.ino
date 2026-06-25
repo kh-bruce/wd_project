@@ -40,31 +40,35 @@ const char* TOPIC_UPTIME    = "wd/tower/state/uptime";   // retain=true
 const char* TOPIC_RSSI      = "wd/tower/state/rssi";     // retain=true
 
 // ---- Sensor ----
-#define INPIN 32
+#define INPIN 32             // ADC1_CH4 (GPIO32)。ADC1 不受 WiFi 影響（WiFi 用 ADC2）
 #define DEPTH_COUNT 9
-float depth[DEPTH_COUNT] = {};
-int   depth_index = 0;
-float avg_max = 0.0;
-float avg_min = 401.0;
-bool  over1loop = false;
-bool  haveReading = false;   // true once at least one batch has produced a value
+#define TIMES2AVG 300        // 每湊滿這麼多次 analogRead 產生一個批次平均值
+#define EMA_ALPHA 0.30f      // 對「9-slot 視窗平均」再做一層 EMA；alpha 越小越平滑、反應越慢
 
-float temp = 0;
-// 每湊滿這麼多次 analogRead 就產生一個新的批次平均值。
-// 從 5000 大幅降低：arduino-timer 每次 loop() 最多只跑 collectDate 一次，
-// 所以實際取樣率 = loop() 迭代率。批次越小，即使 WiFi/MQTT 偶爾阻塞拖慢
-// loop()，也能每 1~2 秒就備好一個新的水位值，發佈才不會被餓死。
-#define TIMES2AVG 300
-int   sampleCount = 0;
+// 取樣已搬到獨立的 FreeRTOS task（samplingTask, core 1），不再跑在 loop() 上，
+// 所以 loop() 裡的 MQTT/WiFi socket 阻塞「不會」再凍結 ADC 取樣（Fix 3）。
+//
+// 以下四個是「跨 task 共享」變數：只由 samplingTask 寫、只由 loop()/sendData 讀。
+// 每個都是自然對齊的單字組純量（float/bool）→ 在 Xtensa LX6 上 load/store 為單一
+// 指令，天生 atomic；ESP32 內部 SRAM 不經 per-core cache，兩核共享，無 cache 一致性
+// 問題。因此 volatile（強制編譯器實際讀寫、不快取在暫存器）就足夠，不需要 portMUX/mutex。
+// 三個 float 各自發到「獨立」的 MQTT topic，不需要被當成同一筆快照一起讀，
+// 且 avg_max/avg_min 是 smoothedLevel 的單調極值，撕裂讀也不會破壞 min<=level<=max。
+volatile float smoothedLevel = 0.0f;
+volatile float avg_max = 0.0f;
+volatile float avg_min = 401.0f;
+volatile bool  haveReading = false;   // true once at least one batch has produced a value
 
-// 解耦「發佈」與「湊滿一批取樣」：sendData 每秒都會發佈 smoothedLevel，
-// 不再等 needUpdate。smoothedLevel 是對「9-slot 視窗平均」再做一層 EMA，
-// 額外增加平滑度。alpha 越小越平滑、反應越慢。
-float smoothedLevel = 0.0;
-#define EMA_ALPHA 0.30f
+// samplingTask 私有狀態（只有該 task 碰，刻意不加 volatile）。
+static float depth[DEPTH_COUNT] = {};
+static int   depth_index = 0;
+static bool  over1loop = false;
+static float temp = 0.0f;
+static int   sampleCount = 0;
 
-// ---- Timers (replaces BlynkTimer) ----
-auto timer_sensor = timer_create_default(); // collectDate, every 2ms
+TaskHandle_t samplingTaskHandle = nullptr;
+
+// ---- Timers (取樣 timer 已移除，改由 samplingTask 負責) ----
 auto timer_send   = timer_create_default(); // sendData,    every 1000ms
 auto timer_uptime = timer_create_default(); // uptime/rssi, every 1000ms
 
@@ -167,9 +171,10 @@ bool mqttReconnect() {
 }
 
 // ===========================================================================
-// Sensor collection (unchanged logic from the original sketch)
+// Sensor collection (sampling logic unchanged; now driven by samplingTask)
 // ===========================================================================
-bool collectDate(void*) {
+// ADC1/GPIO32 的唯一擁有者。只能由 samplingTask 呼叫。
+void collectDateOnce() {
   temp += analogRead(INPIN) / 10;
   sampleCount += 1;
   if (sampleCount >= TIMES2AVG) {
@@ -192,17 +197,35 @@ bool collectDate(void*) {
     for (int i = 0; i < n; i++) sum += depth[i];
     float windowAvg = (float)(sum / n);
 
+    // 先在 task-local 算好，EMA 的 read-modify-write 讀的是上一個 smoothedLevel。
+    float newLevel;
     if (!haveReading) {
-      smoothedLevel = windowAvg;   // 第一筆直接帶入，避免從 0 慢慢爬上來
-      haveReading = true;
+      newLevel = windowAvg;   // 第一筆直接帶入，避免從 0 慢慢爬上來
     } else {
-      smoothedLevel = EMA_ALPHA * windowAvg + (1.0f - EMA_ALPHA) * smoothedLevel;
+      newLevel = EMA_ALPHA * windowAvg + (1.0f - EMA_ALPHA) * smoothedLevel;
     }
 
-    if (avg_max < smoothedLevel) avg_max = smoothedLevel;
-    if (avg_min > smoothedLevel) avg_min = smoothedLevel;
+    // 寫入順序很重要：先發佈水位，極值次之，最後才升起 haveReading 閘門，
+    // 確保 consumer 看到 haveReading==true 時 smoothedLevel 已是新值。
+    smoothedLevel = newLevel;
+    if (avg_max < newLevel) avg_max = newLevel;
+    if (avg_min > newLevel) avg_min = newLevel;
+    haveReading = true;
   }
-  return true; // repeat
+}
+
+// 專責 ADC 取樣的 task。優先權 = loopTask(1)，同核 round-robin 分時，
+// 因此永遠不會餓死唯一餵看門狗的 loopTask。vTaskDelayUntil 提供無漂移的固定
+// 節奏，且每次迭代「一定」block（讓出 core），所以 loopTask/IDLE1 都跑得到、
+// 看門狗不會誤觸。loop() 裡 mqtt.connect() 阻塞時 loopTask 進入 Blocked，
+// core 1 讓給本 task → 取樣持續不中斷（這就是 Fix 3 的核心）。
+void samplingTask(void*) {
+  const TickType_t kPeriod = pdMS_TO_TICKS(5);   // ~5ms → 300 取樣的批次約 1.5s
+  TickType_t last = xTaskGetTickCount();
+  for (;;) {
+    collectDateOnce();
+    vTaskDelayUntil(&last, kPeriod);   // 必須維持每次迭代無條件讓出
+  }
 }
 
 bool sendData(void*) {
@@ -278,9 +301,17 @@ void setup() {
   mqtt.setKeepAlive(15);
   mqttReconnect();
 
-  timer_sensor.every(2, collectDate);
+  // 在 samplingTask 建立前，於本 task 先觸發一次 ADC 的 lazy init，
+  // 確保第一次初始化是單執行緒完成（保險用）。
+  analogRead(INPIN);
+
+  // 取樣 timer 已移除；sendData / uptime 仍由 loop() 的 arduino-timer 驅動。
   timer_send.every(1000, sendData);
   timer_uptime.every(1000, publishUptime);
+
+  // 在 core 1 以 loopTask 同優先權(1) 啟動 ADC 取樣 task —— 詳見 samplingTask 註解。
+  xTaskCreatePinnedToCore(samplingTask, "sample", 4096, NULL, 1,
+                          &samplingTaskHandle, APP_CPU_NUM);
 
   Serial.println("Tower side (MQTT) startup complete");
 }
@@ -291,10 +322,9 @@ void loop() {
   } else if (!mqtt.connected()) {
     mqttReconnect();
   } else {
-    mqtt.loop();
+    mqtt.loop();              // 可能阻塞在 socket；samplingTask 仍持續取樣
   }
 
-  timer_sensor.tick();
   timer_send.tick();
   timer_uptime.tick();
   reset_wdt();
