@@ -1601,29 +1601,14 @@ void setup() {
   // timer_1.in(timer_1_delay, fill_up); // Auto pump start after boot (31 sec) [disabled]
   reset_bad_conn_timer(); // timer_bad_connection — arms the 60s failsafe at boot
 
-  bool ntpSuccess = false;
-  const int ntpServerCount = sizeof(ntpServers) / sizeof(ntpServers[0]);
-  for (int i = 0; i < ntpServerCount && !ntpSuccess; i++) {
-    ntpSuccess = syncTimeWithServer(ntpServers[i], 4, 2000);
-    if (ntpSuccess) currentNtpServerIndex = i;
-  }
-
-  const int ntpIpFallbackCount = sizeof(ntpServersIpFallback) / sizeof(ntpServersIpFallback[0]);
-  for (int i = 0; i < ntpIpFallbackCount && !ntpSuccess; i++) {
-    Serial.println("DNS may be blocked, trying direct NTP IP fallback...");
-    ntpSuccess = syncTimeWithServer(ntpServersIpFallback[i], 4, 2000);
-    if (ntpSuccess) currentNtpServerIndex = -1; // indicates IP fallback
-  }
-
-  if (!ntpSuccess) {
-    Serial.println("ERROR: All NTP servers (names and IPs) failed!");
-  }
-
-  if (ntpSuccess) {
-    scheduleNtpSlow();
-  } else {
-    scheduleNtpFast();
-  }
+  // NTP is synced in the BACKGROUND, not here. Doing a blocking initial sync in
+  // setup() (timeClient.forceUpdate() + DNS resolution) can stall >30s when the
+  // network/DNS is slow or down, and DNS lookup blocks WITHOUT feeding the
+  // watchdog — which tripped the 30s panic WDT and rebooted the board.
+  // scheduleNtpFast() runs one short NTP attempt per tick from loop() via
+  // timer_ntp; it self-promotes to the slow schedule once synced. The prefill
+  // schedule tolerates "time not synced" until the first success.
+  scheduleNtpFast();
 
   logWarning("System startup complete");
   ms = millis();
@@ -1651,12 +1636,15 @@ bool ntpFastPoll(void *) {
   ntpAttemptIndex++;
   bool ok = false;
   String server;
+  // 1 attempt, no in-function delay: the timer spaces out retries, so we keep
+  // each tick (which runs on the loop thread) as short as possible to stay well
+  // clear of the 30s panic watchdog.
   if (idx < nameCount) {
     server = String(ntpServers[idx]);
-    ok = syncTimeWithServer(ntpServers[idx], 2, 1500);
+    ok = syncTimeWithServer(ntpServers[idx], 1, 0);
   } else {
     server = String(ntpServersIpFallback[idx - nameCount]);
-    ok = syncTimeWithServer(ntpServersIpFallback[idx - nameCount], 2, 1500);
+    ok = syncTimeWithServer(ntpServersIpFallback[idx - nameCount], 1, 0);
   }
   if (ok) {
     scheduleNtpSlow();
@@ -1675,12 +1663,13 @@ bool ntpSlowPoll(void *) {
   ntpAttemptIndex++;
   bool ok = false;
   String server;
+  // 1 attempt, no in-function delay (see ntpFastPoll) — keep the tick short.
   if (idx < nameCount) {
     server = String(ntpServers[idx]);
-    ok = syncTimeWithServer(ntpServers[idx], 2, 1500);
+    ok = syncTimeWithServer(ntpServers[idx], 1, 0);
   } else {
     server = String(ntpServersIpFallback[idx - nameCount]);
-    ok = syncTimeWithServer(ntpServersIpFallback[idx - nameCount], 2, 1500);
+    ok = syncTimeWithServer(ntpServersIpFallback[idx - nameCount], 1, 0);
   }
   return true;
 }
