@@ -92,6 +92,21 @@ NTP 背景同步。
 
 ---
 
+## MQTT topics（state，皆 retain=true）
+
+| topic | 內容 |
+|---|---|
+| `wd/pump/state/status` | 完整狀態 JSON（water / pump_status / uptime_s / time …）|
+| `wd/pump/state/pump_status` | `RUNNING` / `STOPPED` / `OVERHEAT_PROTECTION` |
+| `wd/pump/state/min_level`、`.../max_level` | 目前門檻 |
+| `wd/pump/state/bad_conn` | 失聯保護 `ON` / `OFF` |
+| `wd/pump/state/rssi` | WiFi 訊號強度（dBm）→ HA「WiFi Signal」診斷 entity |
+
+可訂閱：`wd/tower/state/water`（tower 水位）。命令：`wd/pump/cmd/#`。
+HA discovery 全部掛在 **WD Pump (1F)** 裝置下。
+
+---
+
 ## 跨裝置依賴（重要）
 
 tower 必須以 **retain=false** 發 `wd/tower/state/water`。否則 pump 重連時 broker 會重播

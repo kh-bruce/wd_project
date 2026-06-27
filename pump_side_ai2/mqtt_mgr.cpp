@@ -7,6 +7,7 @@
 #include "wifi_mgr.h"
 #include "logging.h"
 #include "arduino_secrets.h"
+#include <WiFi.h>        // WiFi.RSSI()
 #include <WiFiClient.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
@@ -123,6 +124,7 @@ void publishStatusMqtt() {
   dtostrf(MIN_WATER_LEVEL, 0, 1, num); mqtt.publish(topic::MIN_LEVEL, num, true);
   dtostrf(MAX_WATER_LEVEL, 0, 1, num); mqtt.publish(topic::MAX_LEVEL, num, true);
   mqtt.publish(topic::BAD_CONN, bad_conn_mode ? "ON" : "OFF", true);
+  snprintf(num, sizeof(num), "%d", (int)WiFi.RSSI()); mqtt.publish(topic::RSSI, num, true);
 }
 
 // ---- HA discovery (table-driven) ----
@@ -182,6 +184,12 @@ static void publishDiscovery() {
     "\"val_tpl\":\"{{value_json.uptime_s}}\",\"unit_of_meas\":\"s\",\"dev_cla\":\"duration\","
     "\"stat_cla\":\"total_increasing\",\"ent_cat\":\"diagnostic\",%s,%s}", topic::STATUS, AV, DEV);
   mqtt.publish("homeassistant/sensor/wd_pump/uptime/config", buf, true);
+
+  snprintf(buf, sizeof(buf),
+    "{\"name\":\"WiFi Signal\",\"uniq_id\":\"wd_pump_rssi\",\"stat_t\":\"%s\","
+    "\"unit_of_meas\":\"dBm\",\"dev_cla\":\"signal_strength\",\"stat_cla\":\"measurement\","
+    "\"ent_cat\":\"diagnostic\",%s,%s}", topic::RSSI, AV, DEV);
+  mqtt.publish("homeassistant/sensor/wd_pump/rssi/config", buf, true);
 
   snprintf(buf, sizeof(buf),
     "{\"name\":\"Local Time\",\"uniq_id\":\"wd_pump_time\",\"stat_t\":\"%s\","

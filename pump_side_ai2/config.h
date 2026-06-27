@@ -74,6 +74,7 @@ namespace topic {
   static const char* MIN_LEVEL      = "wd/pump/state/min_level";
   static const char* MAX_LEVEL      = "wd/pump/state/max_level";
   static const char* BAD_CONN       = "wd/pump/state/bad_conn";
+  static const char* RSSI           = "wd/pump/state/rssi"; // WiFi signal (dBm), retain=true
   static const char* SUB_WATER      = "wd/tower/state/water"; // tower publishes retain=false (failsafe depends on it)
   static const char* CMD_WILDCARD   = "wd/pump/cmd/#";
   static const char* CMD_SETMAX     = "wd/pump/cmd/set_max_level";
