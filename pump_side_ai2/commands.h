@@ -18,8 +18,9 @@ enum CmdType {
   CMD_DOOR_STOP,
   CMD_PUMP_RUN,    // manual 5-min run
   CMD_PUMP_STOP,   // manual stop
-  CMD_SET_MAX,     // arg = new max level
-  CMD_SET_MIN      // arg = new min level
+  CMD_SET_MAX,       // arg = new max level
+  CMD_SET_MIN,       // arg = new min level
+  CMD_SET_DEFICIENT  // arg = new deficient (prefill target) level
 };
 
 struct Command {

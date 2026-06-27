@@ -37,9 +37,10 @@ void manual_pump_stop();
 // Water-level evaluation against thresholds (loop thread)
 void check_water_level(float desiredMinWaterLevel);
 
-// Threshold setters (validate + persist to NVS + recompute deficient)
+// Threshold setters (validate + persist to NVS)
 void applySetMax(float f);
 void applySetMin(float f);
+void applySetDeficient(float f);   // prefill target, user-set, within [min,max]
 
 // Blink LED
 void setBlinkInterval(int intervalMs);

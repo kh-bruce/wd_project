@@ -64,6 +64,7 @@ static void runCommand(const Command &c) {
     case CMD_PUMP_STOP: manual_pump_stop();   record_command("manualpumpstop"); break;
     case CMD_SET_MAX:   applySetMax(c.arg);   record_command("setmax:" + String(c.arg, 1)); break;
     case CMD_SET_MIN:   applySetMin(c.arg);   record_command("setmin:" + String(c.arg, 1)); break;
+    case CMD_SET_DEFICIENT: applySetDeficient(c.arg); record_command("setdeficient:" + String(c.arg, 1)); break;
   }
 }
 

@@ -14,7 +14,7 @@ unsigned long pumpOnSinceMs = 0;
 
 float MAX_WATER_LEVEL = cfg::DEFAULT_MAX_LEVEL;
 float MIN_WATER_LEVEL = cfg::DEFAULT_MIN_LEVEL;
-float DEFICIENT_WATER_LEVEL = cfg::DEFAULT_MIN_LEVEL;
+float DEFICIENT_WATER_LEVEL = cfg::DEFAULT_DEFICIENT_LEVEL;
 
 String        lastCommand = "none";
 unsigned long lastCommandMs = 0;
@@ -56,14 +56,9 @@ void setBlinkInterval(int intervalMs) {
 }
 void blinkTick() { timer_blink.tick(); }
 
-static void recomputeDeficientLevel() {
-  DEFICIENT_WATER_LEVEL = (MAX_WATER_LEVEL - MIN_WATER_LEVEL) * cfg::PREFILL_FRACTION + MIN_WATER_LEVEL;
-}
-
 void applySetMax(float f) {
   if (f > MIN_WATER_LEVEL) {
     MAX_WATER_LEVEL = f;
-    recomputeDeficientLevel();
     prefs.putFloat("max", MAX_WATER_LEVEL); // persist to NVS
     logWarning("Max level set to " + String(MAX_WATER_LEVEL, 1));
   } else {
@@ -73,11 +68,22 @@ void applySetMax(float f) {
 void applySetMin(float f) {
   if (f < MAX_WATER_LEVEL) {
     MIN_WATER_LEVEL = f;
-    recomputeDeficientLevel();
     prefs.putFloat("min", MIN_WATER_LEVEL);
     logWarning("Min level set to " + String(MIN_WATER_LEVEL, 1));
   } else {
     logWarning("Min level rejected (must < max " + String(MAX_WATER_LEVEL, 1) + ")");
+  }
+}
+// Deficient = prefill target. User-set (no longer auto-derived). Must sit
+// within [min, max] so prefill behaves sensibly.
+void applySetDeficient(float f) {
+  if (f >= MIN_WATER_LEVEL && f <= MAX_WATER_LEVEL) {
+    DEFICIENT_WATER_LEVEL = f;
+    prefs.putFloat("deficient", DEFICIENT_WATER_LEVEL);
+    logWarning("Deficient level set to " + String(DEFICIENT_WATER_LEVEL, 1));
+  } else {
+    logWarning("Deficient level rejected (must be within min " +
+               String(MIN_WATER_LEVEL, 1) + "..max " + String(MAX_WATER_LEVEL, 1) + ")");
   }
 }
 
@@ -212,7 +218,7 @@ void pumpInit() {
   prefs.begin("wdpump", false);
   MAX_WATER_LEVEL = prefs.getFloat("max", cfg::DEFAULT_MAX_LEVEL);
   MIN_WATER_LEVEL = prefs.getFloat("min", cfg::DEFAULT_MIN_LEVEL);
-  recomputeDeficientLevel();
+  DEFICIENT_WATER_LEVEL = prefs.getFloat("deficient", cfg::DEFAULT_DEFICIENT_LEVEL);
   Serial.printf("Thresholds loaded: max=%.1f min=%.1f deficient=%.1f\n",
                 MAX_WATER_LEVEL, MIN_WATER_LEVEL, DEFICIENT_WATER_LEVEL);
 

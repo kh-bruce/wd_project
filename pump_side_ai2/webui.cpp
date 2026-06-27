@@ -73,6 +73,9 @@ void webuiInit() {
     } else if (req->hasParam("setminlevel")) {
       enqueueCommand(CMD_SET_MIN, req->getParam("setminlevel")->value().toFloat());
       msg = "setmin";
+    } else if (req->hasParam("setdeficientlevel")) {
+      enqueueCommand(CMD_SET_DEFICIENT, req->getParam("setdeficientlevel")->value().toFloat());
+      msg = "setdeficient";
     } else {
       msg = "no command";
     }

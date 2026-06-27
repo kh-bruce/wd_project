@@ -29,10 +29,10 @@ namespace cfg {
   static const uint8_t RELAY_ON  = LOW;
   static const uint8_t RELAY_OFF = HIGH;
 
-  // ---- Water level thresholds (defaults; max/min persisted to NVS) ----
-  static const float DEFAULT_MAX_LEVEL = 120.0f; // 實測最大值 83；2023/11 外部最大壓力測試 122
-  static const float DEFAULT_MIN_LEVEL = 70.0f;  // 實測最小值 46
-  static const float PREFILL_FRACTION  = 0.3f;   // deficient = (max-min)*frac + min
+  // ---- Water level thresholds (defaults; max/min/deficient persisted to NVS) ----
+  static const float DEFAULT_MAX_LEVEL       = 120.0f; // 實測最大值 83；2023/11 外部最大壓力測試 122
+  static const float DEFAULT_MIN_LEVEL       = 70.0f;  // 實測最小值 46
+  static const float DEFAULT_DEFICIENT_LEVEL = 85.0f;  // prefill 目標水位（使用者可調，存 NVS）
 
   // ---- Time windows (hours, local UTC+8) ----
   static const int PREFILL_HOUR_START = 20; // 預先補水區間開始
@@ -73,12 +73,14 @@ namespace topic {
   static const char* PUMP_STATUS    = "wd/pump/state/pump_status";
   static const char* MIN_LEVEL      = "wd/pump/state/min_level";
   static const char* MAX_LEVEL      = "wd/pump/state/max_level";
+  static const char* DEFICIENT_LEVEL = "wd/pump/state/deficient_level";
   static const char* BAD_CONN       = "wd/pump/state/bad_conn";
   static const char* RSSI           = "wd/pump/state/rssi"; // WiFi signal (dBm), retain=true
   static const char* SUB_WATER      = "wd/tower/state/water"; // tower publishes retain=false (failsafe depends on it)
   static const char* CMD_WILDCARD   = "wd/pump/cmd/#";
   static const char* CMD_SETMAX     = "wd/pump/cmd/set_max_level";
   static const char* CMD_SETMIN     = "wd/pump/cmd/set_min_level";
+  static const char* CMD_SETDEFICIENT = "wd/pump/cmd/set_deficient_level";
   static const char* CMD_MANUALPUMP = "wd/pump/cmd/manual_pump";
   static const char* CMD_DOOR       = "wd/pump/cmd/door";
 }

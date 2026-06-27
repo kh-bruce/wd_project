@@ -53,6 +53,7 @@ static void mqttCallback(char* topic, byte* payload, unsigned int len) {
   }
   if (t == topic::CMD_SETMAX) { enqueueCommand(CMD_SET_MAX, v.toFloat()); return; }
   if (t == topic::CMD_SETMIN) { enqueueCommand(CMD_SET_MIN, v.toFloat()); return; }
+  if (t == topic::CMD_SETDEFICIENT) { enqueueCommand(CMD_SET_DEFICIENT, v.toFloat()); return; }
 }
 
 // ---- Status JSON (ArduinoJson -> fixed buffer) ----
@@ -123,6 +124,7 @@ void publishStatusMqtt() {
   char num[16];
   dtostrf(MIN_WATER_LEVEL, 0, 1, num); mqtt.publish(topic::MIN_LEVEL, num, true);
   dtostrf(MAX_WATER_LEVEL, 0, 1, num); mqtt.publish(topic::MAX_LEVEL, num, true);
+  dtostrf(DEFICIENT_WATER_LEVEL, 0, 1, num); mqtt.publish(topic::DEFICIENT_LEVEL, num, true);
   mqtt.publish(topic::BAD_CONN, bad_conn_mode ? "ON" : "OFF", true);
   snprintf(num, sizeof(num), "%d", (int)WiFi.RSSI()); mqtt.publish(topic::RSSI, num, true);
 }
@@ -160,6 +162,12 @@ static void publishDiscovery() {
     "\"stat_t\":\"%s\",\"min\":0,\"max\":200,\"step\":1,\"mode\":\"box\",\"ent_cat\":\"config\",%s,%s}",
     topic::CMD_SETMIN, topic::MIN_LEVEL, AV, DEV);
   mqtt.publish("homeassistant/number/wd_pump/min_level/config", buf, true);
+
+  snprintf(buf, sizeof(buf),
+    "{\"name\":\"Deficient Water Level\",\"uniq_id\":\"wd_pump_deficient_level\",\"cmd_t\":\"%s\","
+    "\"stat_t\":\"%s\",\"min\":0,\"max\":200,\"step\":1,\"mode\":\"box\",\"ent_cat\":\"config\",%s,%s}",
+    topic::CMD_SETDEFICIENT, topic::DEFICIENT_LEVEL, AV, DEV);
+  mqtt.publish("homeassistant/number/wd_pump/deficient_level/config", buf, true);
 
   snprintf(buf, sizeof(buf),
     "{\"name\":\"Manual Pump\",\"uniq_id\":\"wd_pump_manual\",\"cmd_t\":\"%s\","

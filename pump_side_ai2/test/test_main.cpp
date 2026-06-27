@@ -342,14 +342,40 @@ TEST(set_min_persists_and_validates) {
   CHECK(MIN_WATER_LEVEL == 40.0f, "min >= max rejected");
 }
 
+TEST(set_deficient_persists_and_validates) {
+  DESC("Deficient (prefill target) is now USER-SET, not auto-derived; it writes");
+  DESC("to NVS and is rejected unless it sits within [min, max].");
+  STEP("set deficient = 90 (min %.0f, max %.0f)", MIN_WATER_LEVEL, MAX_WATER_LEVEL);
+  applySetDeficient(90.0f);
+  CHECK(DEFICIENT_WATER_LEVEL == 90.0f, "deficient updated");
+  CHECK(g_nvsFloat["deficient"] == 90.0f, "deficient persisted to NVS");
+  STEP("try set deficient = 200 (above max) -> rejected");
+  applySetDeficient(200.0f);
+  CHECK(DEFICIENT_WATER_LEVEL == 90.0f, "deficient > max rejected");
+  STEP("try set deficient = 10 (below min) -> rejected");
+  applySetDeficient(10.0f);
+  CHECK(DEFICIENT_WATER_LEVEL == 90.0f, "deficient < min rejected");
+}
+
+TEST(deficient_not_recomputed_when_min_max_change) {
+  DESC("Changing min/max must NOT silently move the user's deficient value.");
+  STEP("set deficient = 100, then change max=150 and min=40");
+  applySetDeficient(100.0f);
+  applySetMax(150.0f); applySetMin(40.0f);
+  STEP("deficient is still %.0f (no auto-recalc)", DEFICIENT_WATER_LEVEL);
+  CHECK(DEFICIENT_WATER_LEVEL == 100.0f, "deficient stays put when min/max change");
+}
+
 TEST(thresholds_reload_from_nvs_on_init) {
-  DESC("Thresholds survive a reboot: pumpInit() reloads them from NVS.");
-  STEP("set max=140, min=55, then call pumpInit() to simulate a reboot");
-  applySetMax(140.0f); applySetMin(55.0f);
+  DESC("All three thresholds survive a reboot: pumpInit() reloads from NVS.");
+  STEP("set max=140, min=55, deficient=80, then pumpInit() to simulate reboot");
+  applySetMax(140.0f); applySetMin(55.0f); applySetDeficient(80.0f);
   pumpInit();   // simulates reboot: should reload persisted values
-  STEP("after reboot -> max=%.0f, min=%.0f", MAX_WATER_LEVEL, MIN_WATER_LEVEL);
+  STEP("after reboot -> max=%.0f, min=%.0f, deficient=%.0f",
+       MAX_WATER_LEVEL, MIN_WATER_LEVEL, DEFICIENT_WATER_LEVEL);
   CHECK(MAX_WATER_LEVEL == 140.0f, "max survives reboot via NVS");
   CHECK(MIN_WATER_LEVEL == 55.0f,  "min survives reboot via NVS");
+  CHECK(DEFICIENT_WATER_LEVEL == 80.0f, "deficient survives reboot via NVS");
 }
 
 // --- Command queue (thread-safety model: enqueue/dequeue ring buffer) ---

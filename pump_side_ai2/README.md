@@ -44,6 +44,7 @@ Home Assistant 控制，並有安全關鍵的失聯保護（60 秒收不到水�
 | **最大開泵時間** | 無 | 新增 `PUMP_MAX_ON_MS` 絕對上限防線 |
 | **水位儲存** | `String message` 反覆 `toFloat()` | 入口解析一次成 `float` |
 | **門檻 max/min** | 全域變數，**重開機還原** 120/70 | 存 NVS（Preferences），重開保留 |
+| **deficient（prefill 目標）** | `(max-min)*0.3+min` 自動算 | **使用者可調**（HA number entity），存 NVS、重開保留 |
 | **JSON** | String 拼接（跳脫 bug、heap 碎裂）| ArduinoJson |
 | **status 發布** | SSE + MQTT 兩條，可能在 AsyncTCP 執行緒跑 | 只在 loop 產生 → mutex cache，web 端複製 |
 | **Web UI** | 完整 SPA + SSE + 256 筆 log buffer（~19.5KB RAM）| 極簡 fallback（狀態頁 + `/get`）|
@@ -85,7 +86,7 @@ NTP 背景同步。
    恢復供水 → 自動清除回正常。
 5. **過熱 + 復原**：縮短 interval 測 overheat → 冷卻 → 復原會依**當下水位**決定是否重開
    （不盲目開）；冷卻期間觸發失聯，冷卻不被中斷。
-6. **NVS 持久化**：HA 改 max/min → 重開機 → 值保留（不還原 120/70）。
+6. **NVS 持久化**：HA 改 max/min/deficient → 重開機 → 值保留（不還原預設）。
 7. **fallback**：broker 關閉時，`http://192.168.1.217/` 極簡頁可開、`/get?manualpump=1` 仍能入列執行。
 8. **看門狗**：全程不得出現 `task_wdt: ... Aborting`。
 9. 全部通過後，才以 ai2 取代 ai（更名或切換部署）。
@@ -99,6 +100,7 @@ NTP 背景同步。
 | `wd/pump/state/status` | 完整狀態 JSON（water / pump_status / uptime_s / time …）|
 | `wd/pump/state/pump_status` | `RUNNING` / `STOPPED` / `OVERHEAT_PROTECTION` |
 | `wd/pump/state/min_level`、`.../max_level` | 目前門檻 |
+| `wd/pump/state/deficient_level` | prefill 目標水位（使用者可調 → HA「Deficient Water Level」number）|
 | `wd/pump/state/bad_conn` | 失聯保護 `ON` / `OFF` |
 | `wd/pump/state/rssi` | WiFi 訊號強度（dBm）→ HA「WiFi Signal」診斷 entity |
 
