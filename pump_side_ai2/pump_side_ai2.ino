@@ -34,6 +34,7 @@
 #include "mqtt_mgr.h"
 #include "webui.h"
 #include "display.h"
+#include "button.h"
 
 static auto timer_heap          = timer_create_default();
 static auto timer_prefill       = timer_create_default();
@@ -110,6 +111,7 @@ void setup() {
   doorInit();
   failsafeInit();
   displayInit();   // optional OLED; harmless no-op if no panel is wired
+  buttonInit();    // on-board BOOT button (GPIO0): short=cycle style, long=toggle pump
 
   // WiFi: kick off, wait briefly (watchdog-fed), but never lock up on failure.
   wifiBegin();
@@ -140,7 +142,8 @@ void loop() {
   mqttService();          // gated on WiFi; reconnect + mqtt.loop()
   esp_task_wdt_reset();   // cap the network phase: keep one slow phase from
                           // starving the watchdog of the others (defense-in-depth)
-  drainCommands();        // execute queued web/MQTT commands (loop thread)
+  buttonTick();           // BOOT button: enqueues pump cmd / cycles OLED style
+  drainCommands();        // execute queued web/MQTT/button commands (loop thread)
   serviceWaterLevel();    // run threshold logic on new water values
   serviceFailsafe();      // 60s timestamp check -> force-stop if stale
 
