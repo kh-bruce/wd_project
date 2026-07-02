@@ -7,9 +7,10 @@
 
 #include <Arduino.h>
 
-// ---- OLED display style (1=Dashboard, 2=Animated (default), 3=Retro) ----
-// All three are compiled behind this switch; change + reflash to swap looks.
-#define DISPLAY_STYLE 3
+// ---- OLED display style (1=Retro, 2=Big Number, 3=Status Cards,
+//       4=Radial Ring, 5=Split Panel). Button short-press cycles 1..5;
+//       selection persists to NVS. This is the factory default. ----
+#define DISPLAY_STYLE 2
 
 // ---- Device identity / network ----
 namespace cfg {
@@ -32,6 +33,15 @@ namespace cfg {
   static const uint8_t PIN_DOOR_STOP  = 18;
   static const uint8_t RELAY_ON  = HIGH;
   static const uint8_t RELAY_OFF = LOW;
+
+  // ---- On-board BOOT button (GPIO0) reused as a UI button ----
+  // GPIO0 is the strapping pin: it MUST be released at boot/reset (else the
+  // chip enters flash-download mode), so button reads are ignored for the
+  // first BUTTON_BOOT_IGNORE_MS. Active-LOW (pressed = LOW) via INPUT_PULLUP.
+  static const uint8_t PIN_BUTTON = 0;
+  static const unsigned long BUTTON_DEBOUNCE_MS    = 60;    // contact debounce
+  static const unsigned long BUTTON_LONGPRESS_MS   = 2000;  // >= this held = long press (toggle pump)
+  static const unsigned long BUTTON_BOOT_IGNORE_MS = 1000;  // ignore GPIO0 right after boot
 
   // ---- OLED (I2C SSD1306 128x64); GPIO21/22 are the ESP32 default I2C pins ----
   static const uint8_t I2C_SDA   = 21;
@@ -61,7 +71,6 @@ namespace cfg {
   static const unsigned long WIFI_RETRY_MS        = 10000;
   static const unsigned long STATUS_PUBLISH_MS    = 2000;
   static const unsigned long DISPLAY_FRAME_MS       = 75;   // OLED redraw/flush throttle (~13fps)
-  static const unsigned long DISPLAY_PAGE_ROTATE_MS = 8000; // Style B: page rotation period
   static const unsigned long DISPLAY_THR_TOGGLE_MS  = 15000; // Style C: SET/REC + LINK row toggle period
   // (OLED pump-running full-screen flash reuses BLINK_NORMAL_MS so it matches the LED.)
 

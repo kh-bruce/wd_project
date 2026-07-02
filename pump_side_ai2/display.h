@@ -15,6 +15,7 @@
 
 #include <Arduino.h>
 
-void displayInit();   // Wire.begin + panel begin(); draws splash + spawns the OLED task. Call once in setup().
+void displayInit();       // Wire.begin + panel begin(); draws splash + spawns the OLED task. Call once in setup().
+void displayCycleStyle(); // advance OLED style 1->..->5->1 and persist to NVS. Call from loop thread (button).
 
 #endif // DISPLAY_H
