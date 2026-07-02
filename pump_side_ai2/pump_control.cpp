@@ -24,7 +24,6 @@ static Preferences prefs;
 // Timers (ticked from pumpTick(), i.e. loop thread)
 static auto timer_overheatTrip    = timer_create_default(); // run -> overheat after OVERHEAT_TRIP_MS
 static auto timer_overheatRecover = timer_create_default(); // overheat -> recover after OVERHEAT_RECOVER_MS
-static auto timer_manualPump      = timer_create_default(); // manual auto-stop
 static auto timer_blink           = timer_create_default();
 
 static bool blinkState = true;
@@ -111,13 +110,9 @@ void pump_stop() {
   // is counting down the thermal protection. A force-stop (failsafe trip or
   // manual stop) must NOT cancel that cooldown or flip the state to STOPPED,
   // or the motor could be restarted hot. Leave OVERHEAT_PROTECTION intact.
-  if (pump_status == OVERHEAT_PROTECTION) {
-    timer_manualPump.cancel();
-    return;
-  }
+  if (pump_status == OVERHEAT_PROTECTION) return;
   if (digitalRead(cfg::PIN_PUMP_RELAY) == cfg::RELAY_OFF) return; // already off
   timer_overheatTrip.cancel();
-  timer_manualPump.cancel(); // a manual run is moot once stopped
   digitalWrite(cfg::PIN_PUMP_RELAY, cfg::RELAY_OFF);
   pump_status = STOPPED;
   pumpStatusChangedMs = millis();
@@ -127,7 +122,6 @@ void pump_stop() {
 
 void pump_overheat_protect() {
   timer_overheatRecover.cancel();
-  timer_manualPump.cancel(); // don't let a stale manual-stop abort cooldown
   setBlinkInterval(cfg::BLINK_OVERHEAT_MS);
   digitalWrite(cfg::PIN_PUMP_RELAY, cfg::RELAY_OFF);
   pump_status = OVERHEAT_PROTECTION;
@@ -150,22 +144,13 @@ static bool overheatRecover_cb(void *) {
   return false; // one-shot
 }
 
-static bool manualStop_cb(void *) {
-  logVerbose("Manual pump timer expired - stopping");
-  pump_stop();
-  return false; // one-shot
-}
-
 void manual_pump_start() {
-  logPhysical("Manual pump started (5 min)");
-  timer_manualPump.cancel();
+  logPhysical("Manual pump started");
   request_pump_to(RUNNING);
-  timer_manualPump.in(cfg::MANUAL_PUMP_MS, manualStop_cb);
 }
 
 void manual_pump_stop() {
   logWarning("Manual pump stop requested");
-  timer_manualPump.cancel();
   request_pump_to(STOPPED);
 }
 
@@ -214,6 +199,11 @@ void pumpInit() {
   pinMode(cfg::PIN_PUMP_RELAY, OUTPUT);
   digitalWrite(cfg::PIN_PUMP_RELAY, cfg::RELAY_OFF);
 
+  // Boot state is STOPPED; stamp the change time so "time in state" counts from
+  // boot. Without this, pump_stop()'s "already off" early-return means the
+  // initial STOPPED state never stamps it and time-in-state stays frozen at 0.
+  pumpStatusChangedMs = millis();
+
   // Load thresholds from NVS (fall back to defaults).
   prefs.begin("wdpump", false);
   MAX_WATER_LEVEL = prefs.getFloat("max", cfg::DEFAULT_MAX_LEVEL);
@@ -228,7 +218,6 @@ void pumpInit() {
 void pumpTick() {
   timer_overheatTrip.tick();
   timer_overheatRecover.tick();
-  timer_manualPump.tick();
 
   // Absolute max-on hard cap (defense in depth, independent of overheat timer).
   if (pump_status == RUNNING && pumpOnSinceMs != 0 &&

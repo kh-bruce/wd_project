@@ -21,7 +21,7 @@ a{color:#22d3ee}</style>
 <h1>WD Pump — local fallback</h1>
 <p>Use this only when MQTT/Home Assistant is unavailable.</p>
 <div>
-<button onclick="g('manualpump=1')">Pump Run 5min</button>
+<button onclick="g('manualpump=1')">Pump Run</button>
 <button onclick="g('manualpumpstop=1')">Pump Stop</button>
 </div><div>
 <button onclick="g('frontdoor=up')">Door Up</button>

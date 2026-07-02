@@ -16,7 +16,7 @@ enum CmdType {
   CMD_DOOR_UP,
   CMD_DOOR_DOWN,
   CMD_DOOR_STOP,
-  CMD_PUMP_RUN,    // manual 5-min run
+  CMD_PUMP_RUN,    // manual run (until max/failsafe/overheat/max-on stops it)
   CMD_PUMP_STOP,   // manual stop
   CMD_SET_MAX,       // arg = new max level
   CMD_SET_MIN,       // arg = new min level

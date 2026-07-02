@@ -48,13 +48,13 @@ void mockReset() {
   latestWater = 0.0f; latestWaterValid = false; lastWaterMs = 0;
   // Force a clean pump module state. The firmware never re-runs setup(), so
   // pumpInit() intentionally does NOT reset pump_status or cancel the static
-  // overheat/manual timers inside pump_control.cpp. For test isolation we
+  // overheat timers inside pump_control.cpp. For test isolation we
   // drive the public API into a known-idle state, then flush any armed
   // one-shot timers by ticking once far in the future and resetting the clock.
   bad_conn_mode = false;
   pump_status = RUNNING;                 // so pump_stop() won't early-return
   g_pinState[cfg::PIN_PUMP_RELAY] = cfg::RELAY_ON;
-  pump_stop();                           // cancels overheat-trip & manual timers
+  pump_stop();                           // cancels overheat-trip timer
   unsigned long save = g_mockMillis;
   g_mockMillis += 60UL * 60 * 1000;      // +1h: fire any stale one-shot timers
   pumpTick();                            // flush overheat-recover etc.

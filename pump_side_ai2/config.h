@@ -52,7 +52,6 @@ namespace cfg {
   // ---- Timing (ms) ----
   static const unsigned long OVERHEAT_TRIP_MS     = 20UL * 60 * 1000; // 多久後啟動過熱保護
   static const unsigned long OVERHEAT_RECOVER_MS  = 10UL * 60 * 1000; // 過熱停機散熱時間
-  static const unsigned long MANUAL_PUMP_MS       = 5UL * 60 * 1000;  // manual run duration
   static const unsigned long PUMP_MAX_ON_MS       = 25UL * 60 * 1000; // absolute hard cap (defense in depth)
   static const unsigned long RELAY_PULSE_MS       = 200;              // 遙控器點擊停留
   static const unsigned long BAD_CONN_DELAY_MS    = 60UL * 1000;      // no water -> bad-conn

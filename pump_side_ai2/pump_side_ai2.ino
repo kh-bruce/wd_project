@@ -144,7 +144,7 @@ void loop() {
   serviceWaterLevel();    // run threshold logic on new water values
   serviceFailsafe();      // 60s timestamp check -> force-stop if stale
 
-  pumpTick();             // overheat/recover/manual/max-on timers + blink
+  pumpTick();             // overheat/recover/max-on timers + blink
   blinkTick();
   doorTick();
   ntpTick();

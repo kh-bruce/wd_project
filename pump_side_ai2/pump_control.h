@@ -24,7 +24,7 @@ extern String        lastCommand;
 extern unsigned long lastCommandMs;
 
 void pumpInit();              // pinMode, load thresholds from NVS, idle pump
-void pumpTick();              // call every loop(): overheat/recover/manual/maxon timers
+void pumpTick();              // call every loop(): overheat/recover/maxon timers
 
 // Core control (loop thread only)
 void request_pump_to(PumpStatus status);
