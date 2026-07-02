@@ -10,6 +10,7 @@
 #include <Wire.h>
 #include <U8g2lib.h>
 #include <WiFi.h>
+#include <Preferences.h>
 
 #include "config.h"
 #include "arduino_secrets.h" // SECRET_MQTT_HOST / SECRET_MQTT_PORT (LINK row)
@@ -30,6 +31,15 @@ static U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /*reset=*/U8X8_PIN_NONE)
 static bool gDisplayPresent = false;
 static TaskHandle_t gDisplayTaskHandle = nullptr;
 static unsigned long gSplashUntilMs = 0;   // keep the boot splash up until this millis()
+
+// Active style (1/2/3), runtime-switchable via the button. Written by the loop
+// thread (displayCycleStyle) and read by the render task; a plain aligned int
+// is atomic on ESP32, and a one-frame-stale read during a switch is harmless.
+// Persisted to NVS so it survives a reboot. DISPLAY_STYLE (config.h) is the
+// factory default when nothing is stored yet.
+static volatile int gDisplayStyle = DISPLAY_STYLE;
+static Preferences gDisplayPrefs;   // same NVS namespace as pump_control ("wdpump")
+
 static void displayTask(void*);   // defined below; spawned at the end of displayInit()
 
 // ---- Snapshot of everything one frame needs (filled on the loop thread) ----
@@ -123,239 +133,8 @@ static void pumpStateAge(const Frame &f, char *out, size_t n) {
 }
 
 // =====================================================================
-// Style A — Info Dashboard
-// =====================================================================
-#if DISPLAY_STYLE == 1
-static void drawDashboard(const Frame &f) {
-  // --- top status bar ---
-  u8g2.setFont(u8g2_font_6x10_tf);
-  // WiFi indicator
-  u8g2.drawStr(0, 8, f.wifiUp ? "WiFi" : "wifi?");
-  // MQTT / link state
-  if (f.badConn)        u8g2.drawStr(34, 8, "!LINK!");
-  else if (f.mqttUp)    u8g2.drawStr(34, 8, "MQTT");
-  else                  u8g2.drawStr(34, 8, "mqtt?");
-  // clock (right-aligned-ish)
-  u8g2.drawStr(86, 8, f.hhmm);
-  u8g2.drawHLine(0, 11, 128);
-
-  // --- hero water number ---
-  u8g2.setFont(u8g2_font_logisoso24_tn);
-  char num[8];
-  if (f.waterValid) snprintf(num, sizeof(num), "%.1f", f.water);
-  else              strncpy(num, "--.-", sizeof(num));
-  u8g2.drawStr(2, 44, num);
-
-  u8g2.setFont(u8g2_font_5x8_tf);
-  u8g2.drawStr(2, 52, "WATER");
-
-  // --- pump badge ---
-  const char *badge;
-  switch (f.pump) {
-    case RUNNING:             badge = " RUN "; break;
-    case OVERHEAT_PROTECTION: badge = "HEAT!"; break;
-    default:                  badge = "STOP "; break;
-  }
-  // blink the HEAT badge
-  bool show = (f.pump != OVERHEAT_PROTECTION) || ((f.nowMs / 400) % 2 == 0);
-  u8g2.setFont(u8g2_font_6x10_tf);
-  int bw = 6 * 5 + 6;
-  int bx = 128 - bw - 2;
-  if (show) {
-    u8g2.drawRBox(bx, 22, bw, 14, 2);
-    u8g2.setDrawColor(0);
-    u8g2.drawStr(bx + 3, 32, badge);
-    u8g2.setDrawColor(1);
-  } else {
-    u8g2.drawRFrame(bx, 22, bw, 14, 2);
-  }
-
-  // --- bottom: tower session min/max (measured) + prefill target ---
-  u8g2.setFont(u8g2_font_5x8_tf);
-  char bot[26];
-  char loStr[6], hiStr[6];
-  if (f.towerMinValid) snprintf(loStr, sizeof(loStr), "%.0f", f.towerMin); else strncpy(loStr, "--", sizeof(loStr));
-  if (f.towerMaxValid) snprintf(hiStr, sizeof(hiStr), "%.0f", f.towerMax); else strncpy(hiStr, "--", sizeof(hiStr));
-  snprintf(bot, sizeof(bot), "min%s max%s fil%.0f", loStr, hiStr, f.deficient);
-  u8g2.drawStr(0, 63, bot);
-  if (!f.waterValid) u8g2.drawStr(98, 52, "STALE");
-}
-#endif
-
-// =====================================================================
-// Style B — Animated water tank + spinning pump + page rotation (DEFAULT)
-// =====================================================================
-#if DISPLAY_STYLE == 2
-// Draw a centrifugal-pump impeller: outer casing + outlet nub + hub + 3
-// backward-curved vanes. The vane set rotates while RUNNING, is static when
-// STOPPED, and is replaced by a blinking X on bad-connection.
-static void drawImpeller(int px, int py, int rOut, int rHub,
-                         PumpStatus pump, bool badConn, unsigned long nowMs) {
-  // Casing (double ring for a heavier, more detailed look) + outlet nub.
-  u8g2.drawCircle(px, py, rOut);
-  u8g2.drawCircle(px, py, rOut - 2);
-  // outlet spout at upper-right (typical volute discharge)
-  u8g2.drawBox(px + rOut - 3, py - rOut + 1, 5, 4);
-
-  if (badConn) {
-    if ((nowMs / 300) % 2 == 0) {
-      int d = rOut - 3;
-      u8g2.drawLine(px - d, py - d, px + d, py + d);
-      u8g2.drawLine(px - d, py + d, px + d, py - d);
-    }
-    u8g2.drawDisc(px, py, rHub);
-    return;
-  }
-
-  // Rotation phase: finer stepping (24 positions/rev) to match the higher fps,
-  // so the vanes turn smoothly rather than snapping between coarse angles.
-  float rot = 0.0f;
-  if (pump == RUNNING) {
-    int step = (nowMs / 45) % 24;          // 24 positions per revolution
-    rot = step * (2.0f * PI / 24.0f);
-  }
-
-  const int rTip = rOut - 3;               // vane tip radius
-  const int rRoot = rHub + 1;              // vane root radius
-  const float curve = 0.6f;                // tangential bend at the tip (radians)
-  for (int b = 0; b < 3; b++) {
-    float base = rot + b * (2.0f * PI / 3.0f);
-    // root point (near hub)
-    int x0 = px + (int)(rRoot * cosf(base));
-    int y0 = py + (int)(rRoot * sinf(base));
-    // mid point (straight radial)
-    float rMid = (rRoot + rTip) * 0.5f;
-    int x1 = px + (int)(rMid * cosf(base));
-    int y1 = py + (int)(rMid * sinf(base));
-    // tip point (bent backward-curved relative to spin)
-    int x2 = px + (int)(rTip * cosf(base + curve));
-    int y2 = py + (int)(rTip * sinf(base + curve));
-    u8g2.drawLine(x0, y0, x1, y1);
-    u8g2.drawLine(x1, y1, x2, y2);
-  }
-  u8g2.drawDisc(px, py, rHub);             // hub on top of the vane roots
-}
-
-static void drawTankPage(const Frame &f) {
-  u8g2.setFont(u8g2_font_6x10_tf);
-  u8g2.drawStr(0, 8, "WATER LEVEL");
-  char num[8];
-  if (f.waterValid) snprintf(num, sizeof(num), "%.1f", f.water);
-  else              strncpy(num, "--.-", sizeof(num));
-  u8g2.drawStr(92, 8, num);
-
-  // Tank outline (left side). Narrowed to x:2..78 to make room for the larger
-  // pump impeller on the right. y:14..52 (leaves a row for big min/max labels).
-  const int tx = 2, ty = 14, tw = 76, th = 38;
-  u8g2.drawFrame(tx, ty, tw, th);
-
-  // Fill from the bottom up, proportional to level within [min,max].
-  float frac = fillFraction(f);
-  int fillH = (int)((th - 4) * frac);
-  int fy = ty + (th - 2) - fillH;
-  if (fillH > 0) u8g2.drawBox(tx + 2, fy, tw - 4, fillH);
-
-  // 1px shimmer line on the surface while pumping.
-  bool pumping = (f.pump == RUNNING);
-  if (pumping && fillH > 0 && (f.nowMs / 150) % 2 == 0) {
-    u8g2.setDrawColor(0);
-    u8g2.drawHLine(tx + 2, fy, tw - 4);
-    u8g2.setDrawColor(1);
-  }
-
-  // min/max labels under the tank — tower's measured session extremes.
-  // Bigger 6x10 font; max on the left, min on the right of the tank's width.
-  u8g2.setFont(u8g2_font_6x10_tf);
-  char lab[8];
-  if (f.towerMinValid) snprintf(lab, sizeof(lab), "min%.0f", f.towerMin);
-  else                 strncpy(lab, "min--", sizeof(lab));
-  u8g2.drawStr(tx, 63, lab);
-  if (f.towerMaxValid) snprintf(lab, sizeof(lab), "max%.0f", f.towerMax);
-  else                 strncpy(lab, "max--", sizeof(lab));
-  // right-align against the tank's right edge (each glyph is 6px wide)
-  u8g2.drawStr(tx + tw - (int)strlen(lab) * 6, 63, lab);
-
-  // --- pump impeller (right side): larger, centrifugal-vane style ---
-  const int px = 104, py = 27;   // center
-  const int rOut = 13;           // casing radius
-  const int rHub = 3;            // hub radius
-  drawImpeller(px, py, rOut, rHub, f.pump, f.badConn, f.nowMs);
-
-  u8g2.setFont(u8g2_font_5x8_tf);
-  const char *st;
-  unsigned long rm = pumpRunMin(f);
-  char pl[10];
-  switch (f.pump) {
-    case RUNNING:             snprintf(pl, sizeof(pl), "RUN%lum", rm); st = pl; break;
-    case OVERHEAT_PROTECTION: st = "HEAT!"; break;
-    default:                  st = "STOP"; break;
-  }
-  // label below the impeller, centered-ish under it
-  u8g2.drawStr(px - 12, 50, st);
-
-  if (f.badConn) {
-    u8g2.setFont(u8g2_font_5x8_tf);
-    if ((f.nowMs / 300) % 2 == 0) u8g2.drawStr(2, 8, "!LINK LOST!");
-  }
-}
-
-static void drawSystemPage(const Frame &f) {
-  u8g2.setFont(u8g2_font_6x10_tf);
-  u8g2.drawStr(0, 8, "SYSTEM");
-  u8g2.drawStr(92, 8, f.hhmm);
-  u8g2.drawHLine(0, 11, 128);
-
-  u8g2.setFont(u8g2_font_6x10_tf);
-  char line[26];
-
-  // WiFi + animated signal bars
-  snprintf(line, sizeof(line), "WiFi %ld", f.rssi);
-  u8g2.drawStr(0, 24, line);
-  // bars: map RSSI (-90..-50) to 0..4
-  int bars = 0;
-  if (f.wifiUp) {
-    if (f.rssi >= -55) bars = 4;
-    else if (f.rssi >= -65) bars = 3;
-    else if (f.rssi >= -75) bars = 2;
-    else if (f.rssi >= -85) bars = 1;
-    else bars = 0;
-  }
-  for (int i = 0; i < 4; i++) {
-    int bh = 3 + i * 3;
-    int bx = 90 + i * 7;
-    if (i < bars) u8g2.drawBox(bx, 24 - bh, 5, bh);
-    else          u8g2.drawFrame(bx, 24 - bh, 5, bh);
-  }
-
-  u8g2.drawStr(0, 38, f.mqttUp ? "MQTT connected" : "MQTT  ...");
-
-  unsigned long up = f.uptimeS;
-  snprintf(line, sizeof(line), "Up   %luh %02lum", up / 3600, (up % 3600) / 60);
-  u8g2.drawStr(0, 52, line);
-
-  u8g2.setFont(u8g2_font_5x8_tf);
-  snprintf(line, sizeof(line), "fill %.0f (prefill %d-%dh)",
-           f.deficient, cfg::PREFILL_HOUR_START, cfg::PREFILL_HOUR_END);
-  u8g2.drawStr(0, 63, line);
-}
-
-static void drawAnimated(const Frame &f) {
-  static unsigned long lastPageMs = 0;
-  static uint8_t page = 0;
-  if (lastPageMs == 0) lastPageMs = f.nowMs;
-  if (f.nowMs - lastPageMs >= cfg::DISPLAY_PAGE_ROTATE_MS) {
-    lastPageMs = f.nowMs;
-    page = (page + 1) % 2;
-  }
-  if (page == 0) drawTankPage(f);
-  else           drawSystemPage(f);
-}
-#endif
-
-// =====================================================================
 // Style C — Retro Terminal
 // =====================================================================
-#if DISPLAY_STYLE == 3
 static void drawRetro(const Frame &f) {
   u8g2.setFont(u8g2_font_5x8_tf);
   char line[28];
@@ -417,19 +196,29 @@ static void drawRetro(const Frame &f) {
   }
   u8g2.drawStr(0, 53, line);
 
-  // uptime + blinking cursor
-  unsigned long up = f.uptimeS;
-  snprintf(line, sizeof(line), "UP   : %02lu:%02lu:%02lu",
-           up / 3600, (up % 3600) / 60, up % 60);
+  // bottom row alternates (same period as the LINK/SET rows): uptime, then
+  // wall-clock time (NTP). Blinking cursor stays on both.
+  if (!showPhaseB) {
+    unsigned long up = f.uptimeS;
+    snprintf(line, sizeof(line), "UP   : %02lu:%02lu:%02lu",
+             up / 3600, (up % 3600) / 60, up % 60);
+  } else {
+    snprintf(line, sizeof(line), "TIME : %s", f.hhmmss);
+  }
   u8g2.drawStr(0, 62, line);
   if ((f.nowMs / 500) % 2 == 0) u8g2.drawStr(118, 62, "_");
 }
-#endif
 
 // =====================================================================
 // Public API
 // =====================================================================
 void displayInit() {
+  // Restore the saved style (falls back to the DISPLAY_STYLE default). Reads a
+  // separate handle on the same "wdpump" NVS namespace pump_control uses.
+  gDisplayPrefs.begin("wdpump", false);
+  gDisplayStyle = gDisplayPrefs.getInt("style", DISPLAY_STYLE);
+  if (gDisplayStyle < 1 || gDisplayStyle > 1) gDisplayStyle = 1;
+
   Wire.begin(cfg::I2C_SDA, cfg::I2C_SCL);
   // EMINOTE: relays/boost/12V-RF on this board couple noise onto I2C. Run the
   // bus SLOW (100kHz) for margin, and hard-cap every transaction so an
@@ -458,6 +247,16 @@ void displayInit() {
   // thread, and loop() never touches the display — so I2C has a single owner.
   xTaskCreatePinnedToCore(displayTask, "oled", 4096, NULL, 1,
                           &gDisplayTaskHandle, APP_CPU_NUM);
+}
+
+// Advance to the next style (1->2->3->1) and persist it. Called from the loop
+// thread (button handler); the render task picks up the new value next frame.
+void displayCycleStyle() {
+  int next = gDisplayStyle + 1;
+  if (next > 3) next = 1;
+  gDisplayStyle = next;
+  gDisplayPrefs.putInt("style", next);   // survive reboot
+  logVerbose("OLED style -> " + String(next));
 }
 
 // Startup / reconnect screen: shown whenever WiFi or MQTT is not up (both at
@@ -534,16 +333,10 @@ static void renderOnce() {
     return;
   }
 
-#if DISPLAY_STYLE == 1
-  drawDashboard(f);
-#elif DISPLAY_STYLE == 2
-  drawAnimated(f);
-#elif DISPLAY_STYLE == 3
-  drawRetro(f);
-#else
-  u8g2.setFont(u8g2_font_6x10_tf);
-  u8g2.drawStr(0, 20, "DISPLAY_STYLE?");
-#endif
+  switch (gDisplayStyle) {
+    case 1:  drawRetro(f); break;
+    default: drawRetro(f); break;   // unknown value -> safe fallback
+  }
 
   // Pump-running alert: flash the WHOLE screen between normal and inverted,
   // at the SAME rate as the onboard status LED while RUNNING (BLINK_NORMAL_MS).
