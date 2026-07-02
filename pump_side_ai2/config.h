@@ -7,27 +7,36 @@
 
 #include <Arduino.h>
 
+// ---- OLED display style (1=Dashboard, 2=Animated (default), 3=Retro) ----
+// All three are compiled behind this switch; change + reflash to swap looks.
+#define DISPLAY_STYLE 3
+
 // ---- Device identity / network ----
 namespace cfg {
   // Static IP for this board (the 1F pump+garage controller).
   // Single source of truth — used by WiFi config AND the HA discovery URL.
-  static const IPAddress DEVICE_IP(192, 168, 1, 217);
+  static const IPAddress DEVICE_IP(192, 168, 1, 218);
   static const IPAddress GATEWAY(192, 168, 1, 200);
   static const IPAddress SUBNET(255, 255, 255, 0);
   static const IPAddress DNS(192, 168, 1, 200);
-  static const char* DEVICE_URL = "http://192.168.1.217/"; // for HA configuration_url
+  static const char* DEVICE_URL = "http://192.168.1.218/"; // for HA configuration_url
 
   // ---- Watchdog ----
   static const int WDT_TIMEOUT_S = 30; // panic enabled
 
-  // ---- GPIO (relays are ACTIVE-LOW: LOW = energized/on) ----
+  // ---- GPIO (relays are ACTIVE-HIGH: HIGH = energized/on) ----
   static const uint8_t PIN_STATUS_LED = 2;
   static const uint8_t PIN_PUMP_RELAY = 4;
   static const uint8_t PIN_DOOR_UP    = 16;
   static const uint8_t PIN_DOOR_DOWN  = 17;
   static const uint8_t PIN_DOOR_STOP  = 18;
-  static const uint8_t RELAY_ON  = LOW;
-  static const uint8_t RELAY_OFF = HIGH;
+  static const uint8_t RELAY_ON  = HIGH;
+  static const uint8_t RELAY_OFF = LOW;
+
+  // ---- OLED (I2C SSD1306 128x64); GPIO21/22 are the ESP32 default I2C pins ----
+  static const uint8_t I2C_SDA   = 21;
+  static const uint8_t I2C_SCL   = 22;
+  static const uint8_t OLED_ADDR = 0x3C;
 
   // ---- Water level thresholds (defaults; max/min/deficient persisted to NVS) ----
   static const float DEFAULT_MAX_LEVEL       = 120.0f; // 實測最大值 83；2023/11 外部最大壓力測試 122
@@ -52,6 +61,10 @@ namespace cfg {
   static const unsigned long MQTT_RECONNECT_MS    = 5000;
   static const unsigned long WIFI_RETRY_MS        = 10000;
   static const unsigned long STATUS_PUBLISH_MS    = 2000;
+  static const unsigned long DISPLAY_FRAME_MS       = 75;   // OLED redraw/flush throttle (~13fps)
+  static const unsigned long DISPLAY_PAGE_ROTATE_MS = 8000; // Style B: page rotation period
+  static const unsigned long DISPLAY_THR_TOGGLE_MS  = 15000; // Style C: SET/REC + LINK row toggle period
+  // (OLED pump-running full-screen flash reuses BLINK_NORMAL_MS so it matches the LED.)
 
   // ---- Blink intervals (ms) ----
   static const int BLINK_NORMAL_MS   = 1000; // waiting / pump on
@@ -77,6 +90,8 @@ namespace topic {
   static const char* BAD_CONN       = "wd/pump/state/bad_conn";
   static const char* RSSI           = "wd/pump/state/rssi"; // WiFi signal (dBm), retain=true
   static const char* SUB_WATER      = "wd/tower/state/water"; // tower publishes retain=false (failsafe depends on it)
+  static const char* SUB_AVG_MAX    = "wd/tower/state/avg_max"; // tower session max (retain=true; DISPLAY ONLY, not failsafe)
+  static const char* SUB_AVG_MIN    = "wd/tower/state/avg_min"; // tower session min (retain=true; DISPLAY ONLY, not failsafe)
   static const char* CMD_WILDCARD   = "wd/pump/cmd/#";
   static const char* CMD_SETMAX     = "wd/pump/cmd/set_max_level";
   static const char* CMD_SETMIN     = "wd/pump/cmd/set_min_level";

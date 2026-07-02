@@ -41,6 +41,14 @@ extern volatile float        latestWater;
 extern volatile bool         latestWaterValid;
 extern volatile unsigned long lastWaterMs;
 
+// Tower session max/min, for DISPLAY ONLY (the OLED). These come from
+// retain=true topics, so they must NOT touch lastWaterMs / the failsafe clock
+// (a retained replay is not proof of liveness). Guarded by cmdMux.
+extern volatile float        towerAvgMax;
+extern volatile bool         towerAvgMaxValid;
+extern volatile float        towerAvgMin;
+extern volatile bool         towerAvgMinValid;
+
 // Called from any thread (web/MQTT). Non-blocking; drops if full.
 inline void enqueueCommand(CmdType type, float arg = 0) {
   portENTER_CRITICAL(&cmdMux);
@@ -61,6 +69,42 @@ inline void recordWater(float value, bool valid) {
   latestWater = value;
   latestWaterValid = valid;
   lastWaterMs = millis();
+  portEXIT_CRITICAL(&cmdMux);
+}
+
+// Read the latest water level + valid flag as one consistent snapshot. The
+// pair is written together under cmdMux in recordWater(), so readers (e.g. the
+// OLED on the loop thread) must take the same lock to avoid a torn read of a
+// new "valid" against a stale value. Mirrors the cmdMux read idiom in
+// serviceWaterLevel(). Copies only — no work inside the critical section.
+inline void waterSnapshot(float &valueOut, bool &validOut) {
+  portENTER_CRITICAL(&cmdMux);
+  valueOut = latestWater;
+  validOut = latestWaterValid;
+  portEXIT_CRITICAL(&cmdMux);
+}
+
+// Record tower session max/min (DISPLAY ONLY). Deliberately does NOT update
+// lastWaterMs — these arrive retained and must not feed the liveness failsafe.
+inline void recordTowerMax(float value, bool valid) {
+  portENTER_CRITICAL(&cmdMux);
+  towerAvgMax = value;
+  towerAvgMaxValid = valid;
+  portEXIT_CRITICAL(&cmdMux);
+}
+inline void recordTowerMin(float value, bool valid) {
+  portENTER_CRITICAL(&cmdMux);
+  towerAvgMin = value;
+  towerAvgMinValid = valid;
+  portEXIT_CRITICAL(&cmdMux);
+}
+
+// Read the tower session max/min as one snapshot (loop thread / OLED).
+inline void towerStatsSnapshot(float &maxOut, bool &maxValid,
+                               float &minOut, bool &minValid) {
+  portENTER_CRITICAL(&cmdMux);
+  maxOut = towerAvgMax;  maxValid = towerAvgMaxValid;
+  minOut = towerAvgMin;  minValid = towerAvgMinValid;
   portEXIT_CRITICAL(&cmdMux);
 }
 

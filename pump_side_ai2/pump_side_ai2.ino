@@ -33,6 +33,7 @@
 #include "door_control.h"
 #include "mqtt_mgr.h"
 #include "webui.h"
+#include "display.h"
 
 static auto timer_heap          = timer_create_default();
 static auto timer_prefill       = timer_create_default();
@@ -91,12 +92,24 @@ static void serviceWaterLevel() {
 void setup() {
   Serial.begin(115200);
   Serial.println("Configuring WDT...");
+#if ESP_IDF_VERSION_MAJOR >= 5
+  // ESP32 Arduino core 3.x / IDF v5+: esp_task_wdt_init takes a config struct.
+  const esp_task_wdt_config_t wdtConfig = {
+    .timeout_ms = (uint32_t)cfg::WDT_TIMEOUT_S * 1000,
+    .idle_core_mask = 0,
+    .trigger_panic = true, // panic -> reboot
+  };
+  esp_task_wdt_init(&wdtConfig);
+#else
+  // ESP32 Arduino core 2.x / IDF v4: (timeout_s, panic).
   esp_task_wdt_init(cfg::WDT_TIMEOUT_S, true); // panic -> reboot
+#endif
   esp_task_wdt_add(NULL);
 
   pumpInit();
   doorInit();
   failsafeInit();
+  displayInit();   // optional OLED; harmless no-op if no panel is wired
 
   // WiFi: kick off, wait briefly (watchdog-fed), but never lock up on failure.
   wifiBegin();
@@ -125,6 +138,8 @@ void setup() {
 void loop() {
   serviceWifi();          // non-blocking WiFi keepalive
   mqttService();          // gated on WiFi; reconnect + mqtt.loop()
+  esp_task_wdt_reset();   // cap the network phase: keep one slow phase from
+                          // starving the watchdog of the others (defense-in-depth)
   drainCommands();        // execute queued web/MQTT commands (loop thread)
   serviceWaterLevel();    // run threshold logic on new water values
   serviceFailsafe();      // 60s timestamp check -> force-stop if stale
@@ -133,6 +148,8 @@ void loop() {
   blinkTick();
   doorTick();
   ntpTick();
+  displayTick();          // throttled OLED redraw (no-op if no panel)
+  esp_task_wdt_reset();   // cap the I2C flush phase independently of the rest
   timer_heap.tick();
   timer_prefill.tick();
   timer_mqtt_status.tick();

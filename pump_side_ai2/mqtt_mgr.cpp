@@ -39,6 +39,17 @@ static void mqttCallback(char* topic, byte* payload, unsigned int len) {
     recordWater(val, valid);
     return;
   }
+  if (t == topic::SUB_AVG_MAX || t == topic::SUB_AVG_MIN) {
+    // DISPLAY-ONLY tower stats. Parse for the OLED but do NOT call recordWater()
+    // — these are retained, so a replay is not proof of liveness; feeding the
+    // failsafe clock here would falsely keep it alive.
+    char* endp = nullptr;
+    float val = strtof(buf, &endp);
+    bool valid = (endp != buf);
+    if (t == topic::SUB_AVG_MAX) recordTowerMax(val, valid);
+    else                         recordTowerMin(val, valid);
+    return;
+  }
   if (t == topic::CMD_DOOR) {
     String d = v; d.toLowerCase();
     if      (d == "up")   enqueueCommand(CMD_DOOR_UP);
@@ -219,6 +230,8 @@ static bool mqttReconnect() {
     Serial.println("MQTT connected");
     logVerbose("MQTT connected");
     mqtt.subscribe(topic::SUB_WATER, 1);
+    mqtt.subscribe(topic::SUB_AVG_MAX, 1);  // display-only tower session max
+    mqtt.subscribe(topic::SUB_AVG_MIN, 1);  // display-only tower session min
     mqtt.subscribe(topic::CMD_WILDCARD, 1);
     mqtt.publish(topic::AVAIL, "online", true);
     publishDiscovery();

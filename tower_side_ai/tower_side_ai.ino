@@ -265,7 +265,19 @@ void setup() {
   delay(100);
 
   Serial.println("Configuring WDT...");
+#if ESP_IDF_VERSION_MAJOR >= 5
+  // ESP32 Arduino core 3.x / IDF v5+: the core already inits the TWDT, so
+  // reconfigure it instead of init (init returns "already initialized").
+  const esp_task_wdt_config_t wdtConfig = {
+    .timeout_ms = (uint32_t)WDT_TIMEOUT * 1000,
+    .idle_core_mask = 0,
+    .trigger_panic = false, // panic disabled (matches original tower behavior)
+  };
+  esp_task_wdt_reconfigure(&wdtConfig);
+#else
+  // ESP32 Arduino core 2.x / IDF v4: (timeout_s, panic).
   esp_task_wdt_init(WDT_TIMEOUT, false); // panic disabled (matches original tower behavior)
+#endif
   esp_task_wdt_add(NULL);
   lastWdtReset = millis();
 
