@@ -148,8 +148,8 @@ void loop() {
   blinkTick();
   doorTick();
   ntpTick();
-  displayTick();          // throttled OLED redraw (no-op if no panel)
-  esp_task_wdt_reset();   // cap the I2C flush phase independently of the rest
+  // OLED now redraws on its own FreeRTOS task (see display.cpp) — loop() no
+  // longer flushes I2C, so the keepalive can't be starved by a slow sendBuffer.
   timer_heap.tick();
   timer_prefill.tick();
   timer_mqtt_status.tick();

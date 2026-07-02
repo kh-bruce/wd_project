@@ -1,6 +1,9 @@
 # --- macOS junk ---
 .DS_Store
 
+# --- Editor / IDE local settings (per-machine: serial port, etc.) ---
+.vscode/
+
 # --- ESP32 firmware secrets (per-sketch) ---
 # Real credentials live in arduino_secrets.h; only the *.example.h templates are committed.
 */arduino_secrets.h

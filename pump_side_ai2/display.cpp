@@ -28,6 +28,9 @@
 static U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /*reset=*/U8X8_PIN_NONE);
 
 static bool gDisplayPresent = false;
+static TaskHandle_t gDisplayTaskHandle = nullptr;
+static unsigned long gSplashUntilMs = 0;   // keep the boot splash up until this millis()
+static void displayTask(void*);   // defined below; spawned at the end of displayInit()
 
 // ---- Snapshot of everything one frame needs (filled on the loop thread) ----
 struct Frame {
@@ -448,15 +451,51 @@ void displayInit() {
   u8g2.setFont(u8g2_font_6x10_tf);
   u8g2.drawStr(20, 44, "pump 1F  boot");
   u8g2.sendBuffer();
+  gSplashUntilMs = millis() + 2000;   // hold the splash on screen for >=2s
+
+  // Hand the panel over to a dedicated task. From here on, ALL U8g2/Wire access
+  // happens on displayTask — the splash above is the last flush on the setup
+  // thread, and loop() never touches the display — so I2C has a single owner.
+  xTaskCreatePinnedToCore(displayTask, "oled", 4096, NULL, 1,
+                          &gDisplayTaskHandle, APP_CPU_NUM);
 }
 
-void displayTick() {
-  if (!gDisplayPresent) return;
+// Startup / reconnect screen: shown whenever WiFi or MQTT is not up (both at
+// boot and if either link drops later). Staged checklist — WiFi then MQTT —
+// with an animated "..." on the step we're currently waiting on so it's clear
+// the controller is alive and working through the sequence.
+static void drawConnecting(const Frame &f) {
+  // Animated dots for the in-progress step: "", ".", "..", "..." on a ~300ms
+  // cycle. Time-driven (no stored state), so it works fine on the render task.
+  static const char* DOTS[4] = { "", ".", "..", "..." };
+  const char* dots = DOTS[(f.nowMs / 300) % 4];
 
-  static unsigned long lastFrameMs = 0;
+  // Title
+  u8g2.setFont(u8g2_font_7x13B_tf);
+  u8g2.drawStr(10, 12, "WATER DUCK 1F");
+  u8g2.drawHLine(0, 16, 128);
+
+  u8g2.setFont(u8g2_font_6x10_tf);
+
+  // WiFi step: ticked once associated; the pending step shows the dots.
+  char line[24];
+  snprintf(line, sizeof(line), "[%c] WiFi%s",
+           f.wifiUp ? 'v' : ' ', f.wifiUp ? "" : dots);
+  u8g2.drawStr(6, 34, line);
+
+  // MQTT step. Only animate MQTT once WiFi is up (that's the step we're on);
+  // while WiFi is still connecting, MQTT just shows an empty box.
+  snprintf(line, sizeof(line), "[%c] MQTT%s",
+           f.mqttUp ? 'v' : ' ', (f.wifiUp && !f.mqttUp) ? dots : "");
+  u8g2.drawStr(6, 50, line);
+}
+
+// Render one frame: probe the bus, snapshot loop state, draw, and flush over
+// I2C. Runs ONLY on displayTask (below) — the ~100ms sendBuffer() that used to
+// stall loop() now blocks this dedicated task instead. Frame pacing is handled
+// by the task's vTaskDelayUntil, so there is no millis() throttle here.
+static void renderOnce() {
   unsigned long now = millis();
-  if (lastFrameMs != 0 && now - lastFrameMs < cfg::DISPLAY_FRAME_MS) return;
-  lastFrameMs = now;
 
   // Bus liveness probe (cheap, ~every 2s): if the panel stops ACKing — e.g. an
   // EMI-wedged bus or a yanked cable — latch the display OFF so every later
@@ -473,10 +512,28 @@ void displayTick() {
     }
   }
 
+  // Hold the boot splash on screen for its minimum dwell before drawing
+  // anything else. The splash was flushed in displayInit(); we simply don't
+  // overwrite the buffer yet. (Bus probe above still runs.)
+  if (gSplashUntilMs != 0) {
+    if (now < gSplashUntilMs) return;
+    gSplashUntilMs = 0;   // window elapsed; resume normal rendering
+  }
+
   Frame f;
   snapshot(f);
 
   u8g2.clearBuffer();
+
+  // Until BOTH WiFi and MQTT are up, show the connecting screen instead of the
+  // main UI (whose water data isn't meaningful without the tower's MQTT feed).
+  // Re-evaluated every frame, so this also covers a mid-run drop of either link.
+  if (!f.wifiUp || !f.mqttUp) {
+    drawConnecting(f);
+    u8g2.sendBuffer();
+    return;
+  }
+
 #if DISPLAY_STYLE == 1
   drawDashboard(f);
 #elif DISPLAY_STYLE == 2
@@ -499,4 +556,18 @@ void displayTick() {
   }
 
   u8g2.sendBuffer();
+}
+
+// Dedicated OLED task. The I2C flush is the only place we block, and it happens
+// here — never on loop() — so a ~100ms sendBuffer() can no longer starve the
+// MQTT keepalive. Pinned to APP_CPU_NUM like the tower's samplingTask; NOT
+// registered with the task WDT (only loop() is). Every iteration yields via
+// vTaskDelayUntil, which also sets the frame cadence (DISPLAY_FRAME_MS).
+static void displayTask(void*) {
+  const TickType_t period = pdMS_TO_TICKS(cfg::DISPLAY_FRAME_MS);
+  TickType_t last = xTaskGetTickCount();
+  for (;;) {
+    if (gDisplayPresent) renderOnce();
+    vTaskDelayUntil(&last, period);
+  }
 }

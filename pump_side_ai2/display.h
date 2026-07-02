@@ -1,10 +1,11 @@
 // =====================================================================
 // display.h — optional 0.96" I2C OLED (SSD1306 128x64) status screen.
 //
-// Both functions run on the loop thread ONLY (called from setup()/loop()),
-// preserving the "loop is the sole hardware owner" model. The display is
-// strictly optional: if no panel is found at boot, displayTick() is a no-op
-// and the controller runs identically headless.
+// displayInit() runs once in setup(). It draws a boot splash and then spawns a
+// dedicated FreeRTOS task that owns the panel and drives all subsequent redraws
+// — so the ~100ms I2C flush blocks that task, never loop() (which would starve
+// the MQTT keepalive). loop() no longer calls into the display at all. If no
+// panel is found at boot, no task is spawned and the controller runs headless.
 //
 // The U8g2 / Wire dependency lives entirely in display.cpp; this header keeps
 // the rest of the project (and the host test harness) free of it.
@@ -14,7 +15,6 @@
 
 #include <Arduino.h>
 
-void displayInit();   // Wire.begin + panel begin(); latches "present" flag. Call once in setup().
-void displayTick();   // throttled redraw; no-op if the OLED is absent. Call every loop().
+void displayInit();   // Wire.begin + panel begin(); draws splash + spawns the OLED task. Call once in setup().
 
 #endif // DISPLAY_H
