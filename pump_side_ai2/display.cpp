@@ -56,7 +56,7 @@ struct Frame {
   bool         badConn;
   bool         wifiUp;
   long         rssi;
-  char         ssid[20];
+  char         ip[20];
   bool         mqttUp;
   bool         timeValid;
   int          hour;
@@ -78,8 +78,8 @@ static void snapshot(Frame &f) {
   f.badConn       = bad_conn_mode;
   f.wifiUp        = wifiConnected();
   f.rssi          = f.wifiUp ? WiFi.RSSI() : 0;
-  if (f.wifiUp) { String s = WiFi.SSID(); s.toCharArray(f.ssid, sizeof(f.ssid)); }
-  else          { strncpy(f.ssid, "--", sizeof(f.ssid)); }
+  if (f.wifiUp) { String s = WiFi.localIP().toString(); s.toCharArray(f.ip, sizeof(f.ip)); }
+  else          { strncpy(f.ip, "--", sizeof(f.ip)); }
   f.mqttUp        = mqttIsConnected();
   f.nowMs         = millis();
   f.uptimeS       = f.nowMs / 1000;
@@ -172,10 +172,10 @@ static void drawRetro(const Frame &f) {
   if (f.pump != OVERHEAT_PROTECTION || (f.nowMs / 400) % 2 == 0)
     u8g2.drawStr(0, 35, line);
 
-  // LINK row alternates (same period as SET/REC): WiFi SSID+signal, then MQTT.
+  // LINK row alternates (same period as SET/REC): WiFi IP+signal, then MQTT.
   bool showPhaseB = (f.nowMs / cfg::DISPLAY_THR_TOGGLE_MS) % 2 == 1;
   if (!showPhaseB) {
-    if (f.wifiUp) snprintf(line, sizeof(line), "WIFI : %s %ld", f.ssid, f.rssi);
+    if (f.wifiUp) snprintf(line, sizeof(line), "WIFI : %s %ld", f.ip, f.rssi);
     else          snprintf(line, sizeof(line), "WIFI : disconnected");
   } else {
     if (f.mqttUp) snprintf(line, sizeof(line), "MQTT : %s:%d",
