@@ -43,12 +43,6 @@ inline int  analogRead(uint8_t) { return 0; }
 inline void delay(unsigned long ms) { mockAdvance(ms); }
 inline void yield() {}
 
-// ---- IPAddress (only needs to construct; config.h uses it) ----
-struct IPAddress {
-  uint8_t b[4];
-  IPAddress(uint8_t a=0,uint8_t c=0,uint8_t d=0,uint8_t e=0){b[0]=a;b[1]=c;b[2]=d;b[3]=e;}
-};
-
 // ---- Minimal Arduino String ----
 class String {
 public:

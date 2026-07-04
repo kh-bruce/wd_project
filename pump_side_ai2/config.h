@@ -12,16 +12,7 @@
 //       selection persists to NVS. This is the factory default. ----
 #define DISPLAY_STYLE 2
 
-// ---- Device identity / network ----
 namespace cfg {
-  // Static IP for this board (the 1F pump+garage controller).
-  // Single source of truth — used by WiFi config AND the HA discovery URL.
-  static const IPAddress DEVICE_IP(192, 168, 1, 218);
-  static const IPAddress GATEWAY(192, 168, 1, 200);
-  static const IPAddress SUBNET(255, 255, 255, 0);
-  static const IPAddress DNS(192, 168, 1, 200);
-  static const char* DEVICE_URL = "http://192.168.1.218/"; // for HA configuration_url
-
   // ---- Watchdog ----
   static const int WDT_TIMEOUT_S = 30; // panic enabled
 

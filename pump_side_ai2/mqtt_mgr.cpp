@@ -143,13 +143,19 @@ void publishStatusMqtt() {
 
 // ---- HA discovery (table-driven) ----
 #if USE_HA_DISCOVERY
-static const char* DEV =
-  "\"dev\":{\"ids\":[\"wd_pump\"],\"name\":\"WD Pump (1F)\",\"mdl\":\"ESP32\",\"mf\":\"wd_project\",\"cu\":\"http://192.168.1.217/\"}";
 static const char* AV =
   "\"avty_t\":\"wd/pump/avail\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\"";
 
 static void publishDiscovery() {
   char buf[640];
+
+  // Device block. cu = the current DHCP address (valid here: discovery is only
+  // published right after MQTT connects, so WiFi is up).
+  char DEV[128];
+  snprintf(DEV, sizeof(DEV),
+    "\"dev\":{\"ids\":[\"wd_pump\"],\"name\":\"WD Pump (1F)\",\"mdl\":\"ESP32\","
+    "\"mf\":\"wd_project\",\"cu\":\"http://%s/\"}",
+    WiFi.localIP().toString().c_str());
 
   snprintf(buf, sizeof(buf),
     "{\"name\":\"Pump Status\",\"uniq_id\":\"wd_pump_status\",\"stat_t\":\"%s\","

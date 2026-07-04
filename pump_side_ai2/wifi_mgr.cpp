@@ -11,16 +11,16 @@ static bool wifiWasConnected = false;
 
 bool wifiConnected() { return WiFi.status() == WL_CONNECTED; }
 
-// Heavy one-time setup (mode/static-IP/auto-reconnect) runs ONCE; retries just
+// Heavy one-time setup (mode/auto-reconnect) runs ONCE; retries just
 // re-associate without powering the radio off — so we don't fight the SDK's
 // auto-reconnect, tear down the netif, or destabilize AsyncWebServer.
+// IP comes from DHCP.
 void wifiBegin() {
   static bool configured = false;
   if (!configured) {
     WiFi.persistent(false);
     WiFi.mode(WIFI_STA);
     WiFi.setAutoReconnect(true);
-    WiFi.config(cfg::DEVICE_IP, cfg::GATEWAY, cfg::SUBNET, cfg::DNS);
     configured = true;
   }
   Serial.print("Connecting to WiFi SSID: ");
