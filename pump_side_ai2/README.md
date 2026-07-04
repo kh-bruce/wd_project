@@ -85,8 +85,8 @@ prefill 時窗、MQTT topic、HA discovery entity、LWT、WiFi 非阻塞重連�
    HA 自動出現 **WD Pump (1F)** 裝置 + entity。
 3. **執行緒安全壓測**：同時（a）HA 連發 manual_pump RUN/STOP + door 命令、（b）tower 持續發水位，
    觀察數分鐘 → pump GPIO 與 `pump_status` 一致、不卡開/卡關、不重開機。
-4. **失聯保護**：pump 運轉中關掉 tower / broker → 60 秒內強制停泵、`wd/pump/state/bad_conn` 變 ON；
-   恢復供水 → 自動清除回正常。
+4. **失聯保護**：pump 運轉中關掉 tower / broker → 60 秒內強制停泵、`wd/pump/state/bad_conn` 變 ON、
+   HA「Pump Water」變 **unavailable**（不是 0）；恢復供水 → 自動清除回正常、水位恢復顯示。
 5. **過熱 + 復原**：縮短 interval 測 overheat → 冷卻 → 復原會依**當下水位**決定是否重開
    （不盲目開）；冷卻期間觸發失聯，冷卻不被中斷。
 6. **NVS 持久化**：HA 改 max/min/deficient → 重開機 → 值保留（不還原預設）。
@@ -109,6 +109,9 @@ prefill 時窗、MQTT topic、HA discovery entity、LWT、WiFi 非阻塞重連�
 
 可訂閱：`wd/tower/state/water`（tower 水位）。命令：`wd/pump/cmd/#`。
 HA discovery 全部掛在 **WD Pump (1F)** 裝置下。
+「Pump Water」的 availability 除 LWT 外還看 status JSON 的 `water_valid` 與
+`bad_conn_mode`（`avty_mode=all`）：開機尚未收到塔水位、或失聯保護觸發時，
+entity 顯示 **unavailable** — 佔位的 0 不會被寫進 HA recorder / 長期統計。
 
 ---
 

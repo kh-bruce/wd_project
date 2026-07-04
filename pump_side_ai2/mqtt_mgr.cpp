@@ -75,8 +75,15 @@ size_t buildStatusJson(char *buf, size_t buflen) {
   StaticJsonDocument<512> doc;
   unsigned long nowMs = millis();
 
-  doc["water"]        = latestWaterValid ? latestWater : 0.0f;
-  doc["water_valid"]  = latestWaterValid;
+  // Read the value/valid pair as one snapshot (commands.h idiom) — recordWater
+  // can run on the AsyncTCP task via the web /get fallback.
+  float water; bool waterValid;
+  waterSnapshot(water, waterValid);
+  // 0.0f is a placeholder, not a reading. HA never records it: the Pump Water
+  // entity's availability template (publishDiscovery) turns invalid into
+  // "unavailable", keeping fake 0s out of the recorder/statistics.
+  doc["water"]        = waterValid ? water : 0.0f;
+  doc["water_valid"]  = waterValid;
   doc["pump_status"]  = pumpStatusStr();
   doc["minutes_since_change"] = (nowMs - pumpStatusChangedMs) / 60000.0;
   doc["bad_conn_mode"] = bad_conn_mode ? 1 : 0;
@@ -199,10 +206,15 @@ static void publishDiscovery() {
     topic::CMD_DOOR, AV, DEV);
   mqtt.publish("homeassistant/cover/wd_pump/door/config", buf, true);
 
+  // Pump Water gates availability on water_valid + bad_conn (avty_mode=all with
+  // the LWT): no tower data yet / failsafe tripped -> entity shows "unavailable"
+  // instead of the placeholder 0 (same semantics as the tower's exp_aft).
   snprintf(buf, sizeof(buf),
     "{\"name\":\"Pump Water\",\"uniq_id\":\"wd_pump_water\",\"stat_t\":\"%s\","
-    "\"val_tpl\":\"{{value_json.water}}\",\"stat_cla\":\"measurement\",%s,%s}",
-    topic::STATUS, AV, DEV);
+    "\"val_tpl\":\"{{value_json.water}}\",\"stat_cla\":\"measurement\","
+    "\"avty_mode\":\"all\",\"avty\":[{\"t\":\"%s\"},{\"t\":\"%s\",\"val_tpl\":"
+    "\"{{ 'online' if value_json.water_valid and value_json.bad_conn_mode == 0 else 'offline' }}\"}],%s}",
+    topic::STATUS, topic::AVAIL, topic::STATUS, DEV);
   mqtt.publish("homeassistant/sensor/wd_pump/water/config", buf, true);
 
   snprintf(buf, sizeof(buf),
