@@ -13,6 +13,7 @@
 #include "../commands.h"
 #include "../pump_control.h"
 #include "../failsafe.h"
+#include "../door_control.h"
 
 #include <cstdio>
 #include <cstring>
@@ -399,6 +400,46 @@ TEST(command_queue_drops_when_full_without_corruption) {
   while (dequeueCommand(c)) { CHECK(c.type == CMD_DOOR_UP, "no corruption"); drained++; }
   STEP("drained %d commands (capacity-1 = %d)", drained, CMD_QUEUE_SIZE - 1);
   CHECK(drained == CMD_QUEUE_SIZE - 1, "drops excess, keeps capacity-1");
+}
+
+// --- Door relay: one pulse at a time (rapid-click lockout) ---
+static bool doorOn(uint8_t pin) { return g_pinState[pin] == cfg::RELAY_ON; }
+
+TEST(door_click_during_pulse_is_ignored) {
+  DESC("Clicks landing during an active pulse are dropped — first click wins, "
+       "the pulse runs its full length.");
+  doorInit();
+  STEP("click 'up', then 'down' in the same instant (same drainCommands pass)");
+  doorCommand("up");
+  doorCommand("down");
+  CHECK(doorOn(cfg::PIN_DOOR_UP) && !doorOn(cfg::PIN_DOOR_DOWN),
+        "up energized, down ignored");
+  STEP("click 'stop' mid-pulse (+100ms)");
+  mockAdvance(100); doorTick();
+  doorCommand("stop");
+  CHECK(doorOn(cfg::PIN_DOOR_UP) && !doorOn(cfg::PIN_DOOR_STOP),
+        "stop ignored, up still energized");
+  STEP("advance past RELAY_PULSE_MS");
+  mockAdvance(cfg::RELAY_PULSE_MS); doorTick();
+  CHECK(!doorOn(cfg::PIN_DOOR_UP) && !doorOn(cfg::PIN_DOOR_DOWN) &&
+        !doorOn(cfg::PIN_DOOR_STOP), "full-length pulse ended, all relays off");
+}
+
+TEST(door_gap_after_pulse_then_next_command_fires) {
+  DESC("Right after a pulse ends the RELAY_GAP_MS cool-down still blocks; "
+       "once it elapses the next command fires normally.");
+  doorInit();
+  doorCommand("up");
+  mockAdvance(cfg::RELAY_PULSE_MS); doorTick();
+  STEP("click 'stop' immediately after the pulse ended (inside gap)");
+  doorCommand("stop");
+  CHECK(!doorOn(cfg::PIN_DOOR_STOP), "command inside gap ignored");
+  STEP("advance past RELAY_GAP_MS and click 'stop' again");
+  mockAdvance(cfg::RELAY_GAP_MS);
+  doorCommand("stop");
+  CHECK(doorOn(cfg::PIN_DOOR_STOP), "command after gap accepted");
+  mockAdvance(cfg::RELAY_PULSE_MS); doorTick();
+  CHECK(!doorOn(cfg::PIN_DOOR_STOP), "second pulse also resets cleanly");
 }
 
 // =====================================================================

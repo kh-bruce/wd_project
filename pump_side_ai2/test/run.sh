@@ -12,6 +12,7 @@ clang++ -std=c++17 -Wall -Wextra -Wno-unused-parameter \
   "$SRC/commands.cpp" \
   "$SRC/pump_control.cpp" \
   "$SRC/failsafe.cpp" \
+  "$SRC/door_control.cpp" \
   -o /tmp/wd_pump_tests
 
 /tmp/wd_pump_tests
