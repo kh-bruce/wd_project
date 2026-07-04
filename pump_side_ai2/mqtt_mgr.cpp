@@ -11,6 +11,7 @@
 #include <WiFiClient.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
+#include <esp_task_wdt.h>   // feed the WDT around the blocking mqtt.connect()
 
 static WiFiClient mqttWifiClient;
 static PubSubClient mqtt(mqttWifiClient);
@@ -224,8 +225,13 @@ static bool mqttReconnect() {
   if (millis() - lastMqttReconnectAttempt < cfg::MQTT_RECONNECT_MS) return false;
   lastMqttReconnectAttempt = millis();
   Serial.println("MQTT connecting...");
+  // mqtt.connect() blocks (TCP connect + CONNACK wait, up to a few seconds).
+  // Feed the WDT before and after so back-to-back failed laps can't eat the
+  // watchdog window (matches the tower's hardened reconnect).
+  esp_task_wdt_reset();
   bool ok = mqtt.connect(SECRET_MQTT_CLIENTID, SECRET_MQTT_USER, SECRET_MQTT_PASS,
                          topic::AVAIL, 1, true, "offline");
+  esp_task_wdt_reset();
   if (ok) {
     Serial.println("MQTT connected");
     logVerbose("MQTT connected");
@@ -245,7 +251,12 @@ static bool mqttReconnect() {
 void mqttInit() {
   mqtt.setServer(SECRET_MQTT_HOST, SECRET_MQTT_PORT);
   mqtt.setBufferSize(1024);
-  mqtt.setSocketTimeout(5);
+  // PubSubClient does NOT cap the underlying TCP connect(); on a weak link that
+  // lets mqtt.connect() block for many seconds and stack into a 40s reconnect
+  // stall (observed on 1F, not on the offloaded tower). Bound it on the
+  // WiFiClient directly, and shrink the socket timeout, matching the tower fix.
+  mqttWifiClient.setTimeout(2000);  // ms — caps blocking TCP connect
+  mqtt.setSocketTimeout(2);         // s  — was 5; each failed reconnect lap is shorter
   mqtt.setKeepAlive(15);
   mqtt.setCallback(mqttCallback);
   refreshStatusCache(); // prime so /status.json works before the first publish
