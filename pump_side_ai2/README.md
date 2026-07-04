@@ -13,7 +13,7 @@ Home Assistant 控制，並有安全關鍵的失聯保護（60 秒收不到水�
 | 檔案 | 職責 |
 |---|---|
 | `pump_side_ai2.ino` | `setup()` / `loop()` 編排 |
-| `config.h` | GPIO 腳位、MQTT topic、門檻預設、各 interval、`PumpStatus` enum、裝置 IP（集中一處）|
+| `config.h` | GPIO 腳位、MQTT topic、門檻預設、各 interval、`PumpStatus` enum、OLED 預設樣式 |
 | `arduino_secrets.h` | WiFi / MQTT 憑證（gitignored；由 `.example.h` 複製）|
 | `commands.{h,cpp}` | **命令佇列**：portMUX 保護的環狀佇列 + 水位入口（`enqueueCommand`/`recordWater`/`dequeueCommand`）|
 | `logging.h` | 輕量 Serial log |
@@ -24,6 +24,8 @@ Home Assistant 控制，並有安全關鍵的失聯保護（60 秒收不到水�
 | `door_control.{h,cpp}` | 鐵門點動繼電器 |
 | `mqtt_mgr.{h,cpp}` | MQTT 連線/LWT/重連、HA discovery、狀態發布（ArduinoJson）、inbound callback |
 | `webui.{h,cpp}` | 極簡本地 fallback（狀態頁 + `/get` 只入列命令）|
+| `display.{h,cpp}` | OLED（SH1106 128×64）渲染：5 種樣式，跑在獨立 FreeRTOS task |
+| `button.{h,cpp}` | BOOT 鍵（GPIO0）：短按換 OLED 樣式、長按開/關泵 |
 
 ### 安全模型（核心）
 **loop 執行緒是所有硬體、計時器、pump 狀態的唯一擁有者。** web / MQTT handler
@@ -36,7 +38,7 @@ Home Assistant 控制，並有安全關鍵的失聯保護（60 秒收不到水�
 
 | 面向 | ai 版 | ai2 版 |
 |---|---|---|
-| **結構** | 單一 `.ino`（~1708 行）| 19 個模組檔（~1339 行）|
+| **結構** | 單一 `.ino`（~1708 行）| 23 個模組檔（~2156 行）|
 | **執行緒安全** | web/MQTT handler 直接動硬體/計時器（AsyncTCP 執行緒）→ race，pump 可能卡開/卡關 | handler 只入列命令；loop 單一擁有者 |
 | **失聯保護** | `timer_bad_connection` cancel/re-arm（cancel 會失敗，`cannotcanceltimerrrrrr` 計數）| `millis()` 時間戳比對，無 race |
 | **過熱復原** | 無條件 `request_pump_to(RUNNING)` | 重新評估當下水位才決定 |
@@ -50,8 +52,8 @@ Home Assistant 控制，並有安全關鍵的失聯保護（60 秒收不到水�
 | **Web UI** | 完整 SPA + SSE + 256 筆 log buffer（~19.5KB RAM）| 極簡 fallback（狀態頁 + `/get`）|
 
 **刻意保留（行為一致，只換實作）**：失聯保護 60 秒、過熱保護（20 分觸發 / 10 分冷卻）、
-prefill 時窗、鐵門點動 200ms、MQTT topic、HA discovery entity、LWT、WiFi 非阻塞重連、
-NTP 背景同步。
+prefill 時窗、MQTT topic、HA discovery entity、LWT、WiFi 非阻塞重連、NTP 背景同步。
+**後續已再改**：鐵門點動改 400ms 脈衝 + 200ms 鎖定間隔（一次一個）；IP 改 DHCP（不再固定）。
 
 ---
 
@@ -65,19 +67,20 @@ NTP 背景同步。
   `JsonDocument doc;`（v7 移除了 StaticJsonDocument）。
 - ESPAsyncWebSrv + AsyncTCP
 - NTPClient
+- U8g2（olikraus）— OLED 顯示（沒接面板也能跑，開機偵測不到就自動略過）
 
 **Secrets**：`cp arduino_secrets.example.h arduino_secrets.h`，填入 `SECRET_MQTT_PASS`。
 `SECRET_MQTT_HOST` 已是 `192.168.1.215`（zz0004），WiFi SSID 已是 `iHome`。
 板子用 **數字 IP**，不要用 `.local`（ESP32 不解析 mDNS）。
 
-**板子**：NodeMCU-32S（ESP32）。靜態 IP `192.168.1.217`。
+**板子**：NodeMCU-32S（ESP32）。IP 由 DHCP 取得（Serial、OLED Retro 樣式的 WIFI 列、或 HA 裝置頁可查）。
 
 ---
 
 ## 實機驗證清單（安全關鍵 — 全部通過才取代 ai 版）
 
 1. **編譯** 過（上述 library 齊全）。
-2. **基本上線**：Serial 看到 `Connecting to WiFi SSID: iHome` → `IP Address: 192.168.1.217`
+2. **基本上線**：Serial 看到 `Connecting to WiFi SSID: iHome` → `WiFi connected, IP: <DHCP IP>`
    → `MQTT connected`；`mosquitto_sub -t 'wd/#'` 看到 `wd/pump/state/status`；
    HA 自動出現 **WD Pump (1F)** 裝置 + entity。
 3. **執行緒安全壓測**：同時（a）HA 連發 manual_pump RUN/STOP + door 命令、（b）tower 持續發水位，
@@ -87,7 +90,7 @@ NTP 背景同步。
 5. **過熱 + 復原**：縮短 interval 測 overheat → 冷卻 → 復原會依**當下水位**決定是否重開
    （不盲目開）；冷卻期間觸發失聯，冷卻不被中斷。
 6. **NVS 持久化**：HA 改 max/min/deficient → 重開機 → 值保留（不還原預設）。
-7. **fallback**：broker 關閉時，`http://192.168.1.217/` 極簡頁可開、`/get?manualpump=1` 仍能入列執行。
+7. **fallback**：broker 關閉時，`http://<裝置 IP>/` 極簡頁可開、`/get?manualpump=1` 仍能入列執行。
 8. **看門狗**：全程不得出現 `task_wdt: ... Aborting`。
 9. 全部通過後，才以 ai2 取代 ai（更名或切換部署）。
 
