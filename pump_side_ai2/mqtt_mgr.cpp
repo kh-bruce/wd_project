@@ -17,6 +17,7 @@ static WiFiClient mqttWifiClient;
 static PubSubClient mqtt(mqttWifiClient);
 static unsigned long lastMqttReconnectAttempt = 0;
 static bool wasMqttConnected = false;
+static int  mqttConnectCount = 0;   // successful connects since boot (>1 = reconnected)
 
 bool mqttIsConnected() { return mqtt.connected(); }
 
@@ -72,7 +73,7 @@ static void mqttCallback(char* topic, byte* payload, unsigned int len) {
 size_t buildStatusJson(char *buf, size_t buflen) {
   // ArduinoJson v6: StaticJsonDocument (stack). If you upgrade to v7, change
   // this to `JsonDocument doc;` (StaticJsonDocument is removed in v7).
-  StaticJsonDocument<512> doc;
+  StaticJsonDocument<640> doc;
   unsigned long nowMs = millis();
 
   // Read the value/valid pair as one snapshot (commands.h idiom) — recordWater
@@ -86,6 +87,8 @@ size_t buildStatusJson(char *buf, size_t buflen) {
   doc["water_valid"]  = waterValid;
   doc["pump_status"]  = pumpStatusStr();
   doc["minutes_since_change"] = (nowMs - pumpStatusChangedMs) / 60000.0;
+  doc["overheat_rounds"]     = overheatRounds;
+  doc["overheat_max_rounds"] = cfg::OVERHEAT_MAX_ROUNDS;
   doc["bad_conn_mode"] = bad_conn_mode ? 1 : 0;
   doc["bad_conn_count"] = bad_conn_count;
 
@@ -99,6 +102,11 @@ size_t buildStatusJson(char *buf, size_t buflen) {
   doc["prefill_from"] = cfg::PREFILL_HOUR_START;
   doc["prefill_to"]   = cfg::PREFILL_HOUR_END;
   doc["uptime_s"]    = nowMs / 1000;
+  doc["ip"]          = WiFi.localIP().toString();
+  doc["free_heap"]     = ESP.getFreeHeap();
+  doc["min_free_heap"] = ESP.getMinFreeHeap();
+  doc["fw_built"]      = __DATE__ " " __TIME__;
+  doc["mqtt_connect_count"] = mqttConnectCount;
   doc["last_command"] = lastCommand;
   unsigned long waterMs;
   portENTER_CRITICAL(&cmdMux);
@@ -114,11 +122,11 @@ size_t buildStatusJson(char *buf, size_t buflen) {
 // statusMux. Avoids building the JSON on the AsyncTCP task, which would read
 // loop-owned state (incl. the String lastCommand) cross-thread and risk a
 // heap use-after-free.
-static char statusCache[640];
+static char statusCache[768];
 static portMUX_TYPE statusMux = portMUX_INITIALIZER_UNLOCKED;
 
 void refreshStatusCache() {
-  char tmp[640];
+  char tmp[768];
   size_t n = buildStatusJson(tmp, sizeof(tmp));
   portENTER_CRITICAL(&statusMux);
   memcpy(statusCache, tmp, n + 1); // include NUL
@@ -135,7 +143,7 @@ size_t copyStatusCache(char *out, size_t outlen) {
 void publishStatusMqtt() {
   refreshStatusCache(); // keep the web cache fresh on the loop thread
   if (!mqtt.connected()) return;
-  char buf[640];
+  char buf[768];
   buildStatusJson(buf, sizeof(buf));
   mqtt.publish(topic::STATUS, buf, true);
   // Flat state topics for the dedicated HA entities.
@@ -223,6 +231,13 @@ static void publishDiscovery() {
     "\"stat_cla\":\"total_increasing\",\"ent_cat\":\"diagnostic\",%s,%s}", topic::STATUS, AV, DEV);
   mqtt.publish("homeassistant/sensor/wd_pump/uptime/config", buf, true);
 
+  // Overheat round within the current fill (0 = first run; cap in attributes).
+  snprintf(buf, sizeof(buf),
+    "{\"name\":\"Overheat Rounds\",\"uniq_id\":\"wd_pump_overheat_rounds\",\"stat_t\":\"%s\","
+    "\"val_tpl\":\"{{value_json.overheat_rounds}}\",\"ic\":\"mdi:sync-alert\","
+    "\"ent_cat\":\"diagnostic\",%s,%s}", topic::STATUS, AV, DEV);
+  mqtt.publish("homeassistant/sensor/wd_pump/overheat_rounds/config", buf, true);
+
   snprintf(buf, sizeof(buf),
     "{\"name\":\"WiFi Signal\",\"uniq_id\":\"wd_pump_rssi\",\"stat_t\":\"%s\","
     "\"unit_of_meas\":\"dBm\",\"dev_cla\":\"signal_strength\",\"stat_cla\":\"measurement\","
@@ -251,6 +266,7 @@ static bool mqttReconnect() {
                          topic::AVAIL, 1, true, "offline");
   esp_task_wdt_reset();
   if (ok) {
+    mqttConnectCount++;
     Serial.println("MQTT connected");
     logVerbose("MQTT connected");
     mqtt.subscribe(topic::SUB_WATER, 1);

@@ -43,7 +43,7 @@ void webuiInit() {
 
   server.on("/status.json", HTTP_GET, [](AsyncWebServerRequest *req) {
     // Serve the loop-produced cache; never build JSON on this (AsyncTCP) task.
-    char buf[640];
+    char buf[768];
     copyStatusCache(buf, sizeof(buf));
     req->send(200, "application/json", buf);
   });
