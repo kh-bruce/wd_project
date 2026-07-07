@@ -13,6 +13,7 @@
 extern PumpStatus    pump_status;
 extern unsigned long pumpStatusChangedMs; // millis() of last state change
 extern unsigned long pumpOnSinceMs;       // millis() when pump last turned ON (0 if off)
+extern int           overheatRounds;      // completed overheat cooldowns this fill (display "+N")
 
 // ---- Thresholds (loaded from / persisted to NVS) ----
 extern float MAX_WATER_LEVEL;

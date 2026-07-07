@@ -41,7 +41,7 @@ Home Assistant 控制，並有安全關鍵的失聯保護（60 秒收不到水�
 | **結構** | 單一 `.ino`（~1708 行）| 23 個模組檔（~2156 行）|
 | **執行緒安全** | web/MQTT handler 直接動硬體/計時器（AsyncTCP 執行緒）→ race，pump 可能卡開/卡關 | handler 只入列命令；loop 單一擁有者 |
 | **失聯保護** | `timer_bad_connection` cancel/re-arm（cancel 會失敗，`cannotcanceltimerrrrrr` 計數）| `millis()` 時間戳比對，無 race |
-| **過熱復原** | 無條件 `request_pump_to(RUNNING)` | 重新評估當下水位才決定 |
+| **過熱復原** | 無條件 `request_pump_to(RUNNING)` | 重新評估當下水位：仍低於 max 則續灌到滿（最多連續 5 輪；深夜不重啟；低於 min 的補水不設限）|
 | **過熱冷卻** | force-stop 會中斷 10 分鐘冷卻 | 過熱中 stop 不取消 recover timer（保護冷卻）|
 | **最大開泵時間** | 無 | 新增 `PUMP_MAX_ON_MS` 絕對上限防線 |
 | **水位儲存** | `String message` 反覆 `toFloat()` | 入口解析一次成 `float` |

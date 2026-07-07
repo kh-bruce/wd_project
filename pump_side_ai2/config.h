@@ -53,6 +53,7 @@ namespace cfg {
   // ---- Timing (ms) ----
   static const unsigned long OVERHEAT_TRIP_MS     = 20UL * 60 * 1000; // 多久後啟動過熱保護
   static const unsigned long OVERHEAT_RECOVER_MS  = 10UL * 60 * 1000; // 過熱停機散熱時間
+  static const int OVERHEAT_MAX_ROUNDS = 5; // 一次加水最多連續輪數（防感測器卡值時無限續灌）
   static const unsigned long PUMP_MAX_ON_MS       = 25UL * 60 * 1000; // absolute hard cap (defense in depth)
   static const unsigned long RELAY_PULSE_MS       = 400;              // 遙控器點擊停留
   static const unsigned long RELAY_GAP_MS         = 200;              // 脈衝結束後的鎖定間隔（一次一個）

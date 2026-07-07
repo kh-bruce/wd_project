@@ -28,6 +28,11 @@ static auto timer_blink           = timer_create_default();
 
 static bool blinkState = true;
 
+// Consecutive overheat rounds within the current fill episode (written on the
+// loop thread only; OLED task reads it — aligned int, atomic on ESP32).
+// Drives the resume cap in overheatRecover_cb.
+int overheatRounds = 0;
+
 const char* pumpStatusStr() {
   switch (pump_status) {
     case RUNNING:             return "RUNNING";
@@ -117,6 +122,7 @@ void pump_stop() {
   pump_status = STOPPED;
   pumpStatusChangedMs = millis();
   pumpOnSinceMs = 0;
+  overheatRounds = 0; // a real stop ends the fill episode
   logPhysical("Pump relay OFF");
 }
 
@@ -139,8 +145,22 @@ static bool overheatRecover_cb(void *) {
   pump_status = STOPPED;
   pumpStatusChangedMs = millis();
   pumpOnSinceMs = 0;
-  // Re-evaluate the CURRENT water level rather than blindly restarting.
-  if (!isBadTime()) check_water_level(MIN_WATER_LEVEL);
+  overheatRounds++;
+  // Resume the interrupted fill: restart whenever water is still below max —
+  // but cap the consecutive rounds so a sensor stuck at a valid mid-range
+  // value can't cycle the pump forever. Past the cap, fall back to the
+  // min-level check: dry-tank protection is never capped.
+  if (!isBadTime()) {
+    if (overheatRounds < cfg::OVERHEAT_MAX_ROUNDS) {
+      check_water_level(MAX_WATER_LEVEL);
+    } else {
+      logWarning("Overheat resume cap reached - min-level check only");
+      check_water_level(MIN_WATER_LEVEL);
+    }
+  }
+  // No resume happened (past max / capped / blocked / quiet hours / no data):
+  // the fill episode is over.
+  if (pump_status != RUNNING) overheatRounds = 0;
   return false; // one-shot
 }
 
@@ -185,7 +205,7 @@ void check_water_level(float desiredMinWaterLevel) {
   Serial.printf("[check_water_level] %.2f (min %.1f max %.1f)\n",
                 num, desiredMinWaterLevel, MAX_WATER_LEVEL);
   if (num < desiredMinWaterLevel) {
-    logWarning("Water BELOW min (" + String(num, 1) + " < " + String(desiredMinWaterLevel, 1) + ")");
+    logWarning("Water BELOW threshold (" + String(num, 1) + " < " + String(desiredMinWaterLevel, 1) + ")");
     request_pump_to(RUNNING);
   } else if (num > MAX_WATER_LEVEL) {
     logVerbose("Water OVER max (" + String(num, 1) + " > " + String(MAX_WATER_LEVEL, 1) + ")");

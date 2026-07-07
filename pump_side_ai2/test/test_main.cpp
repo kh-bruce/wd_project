@@ -264,17 +264,100 @@ TEST(overheat_recovers_and_reevaluates_low_water) {
   CHECK(pump_status == RUNNING, "recover re-evaluates: still low -> restart");
 }
 
-TEST(overheat_recovers_and_stays_off_when_water_ok) {
-  DESC("After cooldown, if water has recovered the pump must NOT blindly restart.");
+TEST(overheat_recovers_and_resumes_fill_below_max) {
+  DESC("After cooldown, a fill interrupted mid-way (between min and max) resumes.");
   STEP("water = 50 -> pump runs to overheat");
   recordWater(50.0f, true); check_water_level(MIN_WATER_LEVEL);
   mockAdvance(cfg::OVERHEAT_TRIP_MS + 1); pumpTick();           // -> overheat
-  STEP("during cooldown the tower reports water = 100 (now above min)");
-  recordWater(100.0f, true);                                    // now plenty of water
+  STEP("during cooldown the tower reports water = 100 (above min, below max)");
+  recordWater(100.0f, true);
   mockAdvance(cfg::OVERHEAT_RECOVER_MS + 1); pumpTick();        // -> recover
-  STEP("after recover -> pump is %s (should stay off, water is fine)", stateName());
-  CHECK(pump_status == STOPPED, "recover does NOT blindly restart when water ok");
-  CHECK(relayOff(), "relay stays off when water ok after recover");
+  STEP("after recover -> pump is %s (should resume filling toward max)", stateName());
+  CHECK(pump_status == RUNNING, "recover resumes the interrupted fill (< max)");
+  CHECK(relayOn(), "relay back on to finish the fill");
+}
+
+TEST(overheat_recovers_and_stays_off_when_water_above_max) {
+  DESC("After cooldown, if water is already above max the pump must NOT restart.");
+  STEP("water = 50 -> pump runs to overheat");
+  recordWater(50.0f, true); check_water_level(MIN_WATER_LEVEL);
+  mockAdvance(cfg::OVERHEAT_TRIP_MS + 1); pumpTick();           // -> overheat
+  STEP("during cooldown the tower reports water = 130 (above max %.0f)", cfg::DEFAULT_MAX_LEVEL);
+  recordWater(130.0f, true);
+  mockAdvance(cfg::OVERHEAT_RECOVER_MS + 1); pumpTick();        // -> recover
+  STEP("after recover -> pump is %s (should stay off, tank is full)", stateName());
+  CHECK(pump_status == STOPPED, "recover does NOT restart when water above max");
+  CHECK(relayOff(), "relay stays off when tank already full");
+}
+
+TEST(overheat_resume_capped_after_max_rounds) {
+  DESC("A sensor stuck between min and max can't cycle the pump forever: resumes stop at the round cap.");
+  STEP("water = 50 -> fill starts; sensor then freezes at 100 (between min and max)");
+  recordWater(50.0f, true); check_water_level(MIN_WATER_LEVEL);
+  recordWater(100.0f, true);
+  STEP("rounds 1-%d: each trip+cooldown resumes the fill", cfg::OVERHEAT_MAX_ROUNDS - 1);
+  for (int i = 1; i < cfg::OVERHEAT_MAX_ROUNDS; i++) {
+    mockAdvance(cfg::OVERHEAT_TRIP_MS + 1); pumpTick();         // -> overheat
+    mockAdvance(cfg::OVERHEAT_RECOVER_MS + 1); pumpTick();      // -> recover
+    CHECK(pump_status == RUNNING, "resumes while under the cap");
+  }
+  STEP("round %d trips; its recovery hits the cap -> min-level check only", cfg::OVERHEAT_MAX_ROUNDS);
+  mockAdvance(cfg::OVERHEAT_TRIP_MS + 1); pumpTick();
+  mockAdvance(cfg::OVERHEAT_RECOVER_MS + 1); pumpTick();
+  CHECK(pump_status == STOPPED, "capped: no resume with water above min");
+  CHECK(relayOff(), "relay off once capped");
+  STEP("capped episode is over -> a NEW fill gets its resume budget back");
+  recordWater(50.0f, true); check_water_level(MIN_WATER_LEVEL);
+  recordWater(100.0f, true);
+  mockAdvance(cfg::OVERHEAT_TRIP_MS + 1); pumpTick();
+  mockAdvance(cfg::OVERHEAT_RECOVER_MS + 1); pumpTick();
+  CHECK(pump_status == RUNNING, "counter was reset when the capped episode ended");
+}
+
+TEST(overheat_cap_never_blocks_below_min_refill) {
+  DESC("Dry-tank protection is not capped: below min the pump keeps cycling past the round cap.");
+  STEP("water = 50 (< min) and frozen there -> fill starts");
+  recordWater(50.0f, true); check_water_level(MIN_WATER_LEVEL);
+  STEP("run %d full trip+cooldown cycles (one past the cap)", cfg::OVERHEAT_MAX_ROUNDS + 1);
+  for (int i = 0; i <= cfg::OVERHEAT_MAX_ROUNDS; i++) {
+    mockAdvance(cfg::OVERHEAT_TRIP_MS + 1); pumpTick();
+    mockAdvance(cfg::OVERHEAT_RECOVER_MS + 1); pumpTick();
+  }
+  STEP("after cycle %d -> pump is %s", cfg::OVERHEAT_MAX_ROUNDS + 1, stateName());
+  CHECK(pump_status == RUNNING, "still refilling below min after the cap");
+}
+
+TEST(overheat_round_counter_resets_on_full_stop) {
+  DESC("Finishing a fill (> max stop) resets the round counter for the next episode.");
+  STEP("fill starts at 50, sensor frozen at 100 -> burn %d resume rounds", cfg::OVERHEAT_MAX_ROUNDS - 1);
+  recordWater(50.0f, true); check_water_level(MIN_WATER_LEVEL);
+  recordWater(100.0f, true);
+  for (int i = 1; i < cfg::OVERHEAT_MAX_ROUNDS; i++) {
+    mockAdvance(cfg::OVERHEAT_TRIP_MS + 1); pumpTick();
+    mockAdvance(cfg::OVERHEAT_RECOVER_MS + 1); pumpTick();
+  }
+  CHECK(pump_status == RUNNING, "still resuming just under the cap");
+  STEP("water = 130 (> max) arrives -> normal stop ends the episode");
+  recordWater(130.0f, true); check_water_level(MIN_WATER_LEVEL);
+  CHECK(pump_status == STOPPED, "stopped past max");
+  STEP("new fill at 50, frozen at 100 -> first cooldown should resume again");
+  recordWater(50.0f, true); check_water_level(MIN_WATER_LEVEL);
+  recordWater(100.0f, true);
+  mockAdvance(cfg::OVERHEAT_TRIP_MS + 1); pumpTick();
+  mockAdvance(cfg::OVERHEAT_RECOVER_MS + 1); pumpTick();
+  CHECK(pump_status == RUNNING, "fresh episode has its full resume budget");
+}
+
+TEST(overheat_recovery_skipped_during_quiet_hours) {
+  DESC("A cooldown ending inside quiet hours does not restart the pump (even below min).");
+  STEP("water = 50 -> pump runs to overheat");
+  recordWater(50.0f, true); check_water_level(MIN_WATER_LEVEL);
+  mockAdvance(cfg::OVERHEAT_TRIP_MS + 1); pumpTick();
+  STEP("clock enters quiet hours before the cooldown ends");
+  g_stubBadTime = true;
+  mockAdvance(cfg::OVERHEAT_RECOVER_MS + 1); pumpTick();
+  CHECK(pump_status == STOPPED, "no restart during quiet hours");
+  CHECK(relayOff(), "relay stays off");
 }
 
 TEST(force_stop_during_cooldown_does_not_cancel_recovery) {
