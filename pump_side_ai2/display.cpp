@@ -48,6 +48,7 @@ struct Frame {
   float        water;
   bool         waterValid;
   PumpStatus   pump;
+  int          rounds;                 // completed overheat cooldowns this fill
   unsigned long pumpOnSinceMs;
   unsigned long pumpStatusChangedMs;  // millis() of last pump-state change
   float        minLevel, maxLevel, deficient;  // pump-side thresholds (config/NVS)
@@ -70,6 +71,7 @@ static void snapshot(Frame &f) {
   waterSnapshot(f.water, f.waterValid);
   towerStatsSnapshot(f.towerMax, f.towerMaxValid, f.towerMin, f.towerMinValid);
   f.pump          = pump_status;
+  f.rounds        = overheatRounds;
   f.pumpOnSinceMs = pumpOnSinceMs;
   f.pumpStatusChangedMs = pumpStatusChangedMs;
   f.minLevel      = MIN_WATER_LEVEL;
@@ -122,6 +124,16 @@ static unsigned long pumpRunMin(const Frame &f) {
   return (f.nowMs - f.pumpOnSinceMs) / 60000UL;
 }
 
+// Pump state tag with the overheat-round suffix: while running or cooling the
+// name gets "+N" appended (N = completed cooldowns this fill, so the first run
+// shows "+0"); stopped shows the plain name.
+static void pumpTag(const Frame &f, char *out, size_t n,
+                    const char *run, const char *heat, const char *stop) {
+  if (f.pump == RUNNING)                  snprintf(out, n, "%s+%d", run, f.rounds);
+  else if (f.pump == OVERHEAT_PROTECTION) snprintf(out, n, "%s+%d", heat, f.rounds);
+  else                                    snprintf(out, n, "%s", stop);
+}
+
 // Format how long the pump has been in its CURRENT state, compactly, into out:
 // "<Ns>" under a minute, "<Nm>" under an hour, else "<Nh Mm>". Works for any
 // state (run/stop/overheat) since it keys off pumpStatusChangedMs.
@@ -157,17 +169,11 @@ static void drawRetro(const Frame &f) {
   snprintf(line, sizeof(line), "WATER: %s %s", num, bar);
   u8g2.drawStr(0, 26, line);
 
-  // pump — show time spent in the CURRENT state after every state name.
-  char age[10];
+  // pump — state (+overheat round) then time spent in the CURRENT state.
+  char age[10], tag[14];
   pumpStateAge(f, age, sizeof(age));
-  switch (f.pump) {
-    case RUNNING:
-      snprintf(line, sizeof(line), "PUMP : RUNNING %s", age); break;
-    case OVERHEAT_PROTECTION:
-      snprintf(line, sizeof(line), "PUMP : OVERHEAT %s", age); break;
-    default:
-      snprintf(line, sizeof(line), "PUMP : STOPPED %s", age); break;
-  }
+  pumpTag(f, tag, sizeof(tag), "RUNNING", "OVERHEAT", "STOPPED");
+  snprintf(line, sizeof(line), "PUMP : %s %s", tag, age);
   // blink the OVERHEAT line
   if (f.pump != OVERHEAT_PROTECTION || (f.nowMs / 400) % 2 == 0)
     u8g2.drawStr(0, 35, line);
@@ -250,15 +256,10 @@ static void drawBigNumber(const Frame &f) {
   int fillW = (int)((bw - 2) * fillFraction(f));
   if (fillW > 0) u8g2.drawBox(bx + 1, by + 1, fillW, bh - 2);
 
-  // --- bottom: pump state + run-min + clock ---
+  // --- bottom: pump state (+overheat round) + run-min + clock ---
   u8g2.setFont(u8g2_font_5x8_tf);
-  char bot[26];
-  const char *st;
-  switch (f.pump) {
-    case RUNNING:             st = "RUN";  break;
-    case OVERHEAT_PROTECTION: st = "HEAT"; break;
-    default:                  st = "STOP"; break;
-  }
+  char bot[26], st[10];
+  pumpTag(f, st, sizeof(st), "RUN", "HEAT", "STOP");
   snprintf(bot, sizeof(bot), "PUMP %s %lum   %s", st, pumpRunMin(f), f.hhmm);
   u8g2.drawStr(0, 63, bot);
 }
@@ -296,9 +297,13 @@ static void drawStatusCards(const Frame &f) {
   u8g2.drawStr(58, 31, num);
 
   // --- RIGHT-BOTTOM-LEFT: PUMP card (framed = emphasis; flashes when RUNNING) ---
+  // Card is too narrow for "HEAT+N" in the big font, so the overheat round
+  // rides on the title row ("PUMP+N") instead.
   u8g2.drawFrame(52, 38, 36, 24);
   u8g2.setFont(u8g2_font_5x8_tf);
-  u8g2.drawStr(56, 46, "PUMP");
+  char lbl[10];
+  pumpTag(f, lbl, sizeof(lbl), "PUMP", "PUMP", "PUMP");
+  u8g2.drawStr(56, 46, lbl);
   const char *st;
   switch (f.pump) {
     case RUNNING:             st = "RUN";  break;
@@ -352,12 +357,8 @@ static void drawRadialRing(const Frame &f) {
 
   // corners
   u8g2.setFont(u8g2_font_5x8_tf);
-  const char *st;
-  switch (f.pump) {
-    case RUNNING:             st = "RUN";  break;
-    case OVERHEAT_PROTECTION: st = "HEAT"; break;
-    default:                  st = "STOP"; break;
-  }
+  char st[10];
+  pumpTag(f, st, sizeof(st), "RUN", "HEAT", "STOP");
   u8g2.drawStr(0, 7, st);                                   // top-left: pump
   u8g2.drawStr(128 - (int)strlen(f.hhmm) * 5, 7, f.hhmm);  // top-right: clock
   u8g2.drawStr(0, 63, f.mqttUp ? "MQTT" : "mqtt?");        // bottom-left: link
@@ -382,13 +383,8 @@ static void drawSplitPanel(const Frame &f) {
   u8g2.drawStr(1, 34, num);
   u8g2.drawHLine(2, 38, 70);
   u8g2.setFont(u8g2_font_6x10_tf);
-  const char *st;
-  switch (f.pump) {
-    case RUNNING:             st = "RUN";  break;
-    case OVERHEAT_PROTECTION: st = "HEAT"; break;
-    default:                  st = "STOP"; break;
-  }
-  char l1[16];
+  char st[10], l1[16];
+  pumpTag(f, st, sizeof(st), "RUN", "HEAT", "STOP");
   snprintf(l1, sizeof(l1), "%s %lum", st, pumpRunMin(f));
   u8g2.drawStr(2, 50, l1);
   u8g2.setFont(u8g2_font_5x8_tf);
