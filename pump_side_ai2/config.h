@@ -7,9 +7,10 @@
 
 #include <Arduino.h>
 
-// ---- OLED display style (1=Retro, 2=Big Number, 3=Status Cards,
-//       4=Radial Ring, 5=Split Panel). Button short-press cycles 1..5;
-//       selection persists to NVS. This is the factory default. ----
+// ---- OLED display style (1=Retro, 2=Big Number, 3=Radial Ring,
+//       4=Split Panel). Button short-press cycles 1..4;
+//       selection persists to NVS, and every reboot auto-advances to the
+//       next style. This is the factory starting point. ----
 #define DISPLAY_STYLE 2
 
 namespace cfg {

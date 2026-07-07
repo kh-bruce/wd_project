@@ -24,7 +24,7 @@ Home Assistant 控制，並有安全關鍵的失聯保護（60 秒收不到水�
 | `door_control.{h,cpp}` | 鐵門點動繼電器 |
 | `mqtt_mgr.{h,cpp}` | MQTT 連線/LWT/重連、HA discovery、狀態發布（ArduinoJson）、inbound callback |
 | `webui.{h,cpp}` | 極簡本地 fallback（狀態頁 + `/get` 只入列命令）|
-| `display.{h,cpp}` | OLED（SH1106 128×64）渲染：5 種樣式，跑在獨立 FreeRTOS task |
+| `display.{h,cpp}` | OLED（SH1106 128×64）渲染：4 種樣式（每次重開機自動輪下一種），跑在獨立 FreeRTOS task |
 | `button.{h,cpp}` | BOOT 鍵（GPIO0）：短按換 OLED 樣式、長按開/關泵 |
 
 ### 安全模型（核心）

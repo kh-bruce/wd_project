@@ -2,9 +2,10 @@
 // display.cpp — 0.96" SSD1306 (128x64) OLED renderer.
 //
 // Loop-thread only. U8g2 full-buffer over hardware I2C. The whole U8g2/Wire
-// dependency is contained here. Five styles selectable via the button
-// (1=Retro, 2=Big Number, 3=Status Cards, 4=Radial Ring, 5=Split Panel); the
-// default is DISPLAY_STYLE in config.h. A missing panel is detected at begin()
+// dependency is contained here. Four styles selectable via the button
+// (1=Retro, 2=Big Number, 3=Radial Ring, 4=Split Panel);
+// every reboot auto-advances to the next style (DISPLAY_STYLE in config.h is
+// the factory starting point). A missing panel is detected at begin()
 // and turns every subsequent tick into a one-comparison no-op.
 // =====================================================================
 #include "display.h"
@@ -33,11 +34,11 @@ static bool gDisplayPresent = false;
 static TaskHandle_t gDisplayTaskHandle = nullptr;
 static unsigned long gSplashUntilMs = 0;   // keep the boot splash up until this millis()
 
-// Active style (1/2/3), runtime-switchable via the button. Written by the loop
+// Active style (1..4), runtime-switchable via the button. Written by the loop
 // thread (displayCycleStyle) and read by the render task; a plain aligned int
 // is atomic on ESP32, and a one-frame-stale read during a switch is harmless.
-// Persisted to NVS so it survives a reboot. DISPLAY_STYLE (config.h) is the
-// factory default when nothing is stored yet.
+// Persisted to NVS; each boot advances one style past the saved one (see
+// displayInit). DISPLAY_STYLE (config.h) is the factory starting point.
 static volatile int gDisplayStyle = DISPLAY_STYLE;
 static Preferences gDisplayPrefs;   // same NVS namespace as pump_control ("wdpump")
 
@@ -243,85 +244,29 @@ static void drawBigNumber(const Frame &f) {
   else                      u8g2.drawStr(118, 7, "--");
   u8g2.drawHLine(0, 10, 128);
 
-  // --- hero number: left-aligned, unitless ---
+  // --- fill bar geometry: lifted clear of the bottom text row and thicker;
+  //     also anchors the hero number's right edge ---
+  const int bx = 6, by = 46, bw = 116, bh = 7;
+
+  // --- hero number: right-aligned to the bar's right edge, unitless ---
   u8g2.setFont(u8g2_font_logisoso24_tn);   // biggest confirmed-present digit font
   char num[8];
   if (f.waterValid) snprintf(num, sizeof(num), "%.1f", f.water);
   else              strncpy(num, "--.-", sizeof(num));
-  u8g2.drawStr(4, 42, num);                // x=4 => flush-left, NOT centered
+  u8g2.drawStr(bx + bw - (int)u8g2.getStrWidth(num), 42, num);
 
   // --- fill bar ---
-  const int bx = 6, by = 52, bw = 116, bh = 5;
   u8g2.drawFrame(bx, by, bw, bh);
   int fillW = (int)((bw - 2) * fillFraction(f));
   if (fillW > 0) u8g2.drawBox(bx + 1, by + 1, fillW, bh - 2);
 
-  // --- bottom: pump state (+overheat round) + run-min + clock ---
+  // --- bottom: pump state (+overheat round) + run-min left, clock right ---
   u8g2.setFont(u8g2_font_5x8_tf);
   char bot[26], st[10];
   pumpTag(f, st, sizeof(st), "RUN", "HEAT", "STOP");
-  snprintf(bot, sizeof(bot), "PUMP %s %lum   %s", st, pumpRunMin(f), f.hhmm);
+  snprintf(bot, sizeof(bot), "PUMP %s %lum", st, pumpRunMin(f));
   u8g2.drawStr(0, 63, bot);
-}
-
-// =====================================================================
-// Style — Status Cards: tall SET card (left) + WATER/PUMP/TIME (right).
-// =====================================================================
-static void drawStatusCards(const Frame &f) {
-  char v[8];
-  // --- LEFT: full-height SET card with the five setpoints ---
-  u8g2.drawFrame(2, 2, 46, 60);
-  u8g2.setFont(u8g2_font_5x8_tf);
-  u8g2.drawStr(6, 10, "SET");
-  u8g2.drawHLine(5, 13, 40);
-  // helper: format a setpoint value or "--"
-  #define BN_SET(row_y, label, valid, val) do { \
-      if (valid) snprintf(v, sizeof(v), "%.0f", (double)(val)); else strncpy(v, "--", sizeof(v)); \
-      char line[16]; snprintf(line, sizeof(line), "%-4s%s", label, v); \
-      u8g2.drawStr(6, row_y, line); } while (0)
-  BN_SET(24, "recL", f.towerMinValid, f.towerMin);
-  BN_SET(33, "low",  true,            f.minLevel);
-  BN_SET(42, "pref", true,            f.deficient);
-  BN_SET(51, "max",  true,            f.maxLevel);
-  BN_SET(60, "recH", f.towerMaxValid, f.towerMax);
-  #undef BN_SET
-
-  // --- RIGHT-TOP: WATER card ---
-  u8g2.drawFrame(52, 2, 74, 32);
-  u8g2.setFont(u8g2_font_5x8_tf);
-  u8g2.drawStr(56, 11, "WATER");
-  u8g2.setFont(u8g2_font_logisoso24_tn);
-  char num[8];
-  if (f.waterValid) snprintf(num, sizeof(num), "%.1f", f.water);
-  else              strncpy(num, "--.-", sizeof(num));
-  u8g2.drawStr(58, 31, num);
-
-  // --- RIGHT-BOTTOM-LEFT: PUMP card (framed = emphasis; flashes when RUNNING) ---
-  // Card is too narrow for "HEAT+N" in the big font, so the overheat round
-  // rides on the title row ("PUMP+N") instead.
-  u8g2.drawFrame(52, 38, 36, 24);
-  u8g2.setFont(u8g2_font_5x8_tf);
-  char lbl[10];
-  pumpTag(f, lbl, sizeof(lbl), "PUMP", "PUMP", "PUMP");
-  u8g2.drawStr(56, 46, lbl);
-  const char *st;
-  switch (f.pump) {
-    case RUNNING:             st = "RUN";  break;
-    case OVERHEAT_PROTECTION: st = "HEAT"; break;
-    default:                  st = "STOP"; break;
-  }
-  u8g2.setFont(u8g2_font_6x10_tf);
-  u8g2.drawStr(56, 60, st);
-  u8g2.setFont(u8g2_font_5x8_tf);
-  snprintf(v, sizeof(v), "%lum", pumpRunMin(f));
-  u8g2.drawStr(76, 60, v);
-
-  // --- RIGHT-BOTTOM-RIGHT: TIME card ---
-  u8g2.drawFrame(90, 38, 36, 24);
-  u8g2.setFont(u8g2_font_5x8_tf);
-  u8g2.drawStr(94, 46, "TIME");
-  u8g2.setFont(u8g2_font_6x10_tf);
-  u8g2.drawStr(93, 60, f.hhmm);
+  u8g2.drawStr(128 - (int)strlen(f.hhmm) * 5, 63, f.hhmm);
 }
 
 // =====================================================================
@@ -427,11 +372,16 @@ static void drawSplitPanel(const Frame &f) {
 // Public API
 // =====================================================================
 void displayInit() {
-  // Restore the saved style (falls back to the DISPLAY_STYLE default). Reads a
-  // separate handle on the same "wdpump" NVS namespace pump_control uses.
+  // Load the saved style (falls back to the DISPLAY_STYLE default), then
+  // advance one step (5 -> 1): every reboot rotates to the next style. The
+  // advanced value is persisted immediately so the next boot rotates again
+  // and the button keeps cycling from what's on screen. Reads a separate
+  // handle on the same "wdpump" NVS namespace pump_control uses.
   gDisplayPrefs.begin("wdpump", false);
-  gDisplayStyle = gDisplayPrefs.getInt("style", DISPLAY_STYLE);
-  if (gDisplayStyle < 1 || gDisplayStyle > 5) gDisplayStyle = DISPLAY_STYLE;
+  int saved = gDisplayPrefs.getInt("style", DISPLAY_STYLE);
+  if (saved < 1 || saved > 4) saved = DISPLAY_STYLE;
+  gDisplayStyle = (saved % 4) + 1;
+  gDisplayPrefs.putInt("style", gDisplayStyle);
 
   Wire.begin(cfg::I2C_SDA, cfg::I2C_SCL);
   // EMINOTE: relays/boost/12V-RF on this board couple noise onto I2C. Run the
@@ -463,11 +413,11 @@ void displayInit() {
                           &gDisplayTaskHandle, APP_CPU_NUM);
 }
 
-// Advance to the next style (1->..->5->1) and persist it. Called from the loop
+// Advance to the next style (1->..->4->1) and persist it. Called from the loop
 // thread (button handler); the render task picks up the new value next frame.
 void displayCycleStyle() {
   int next = gDisplayStyle + 1;
-  if (next > 5) next = 1;
+  if (next > 4) next = 1;
   gDisplayStyle = next;
   gDisplayPrefs.putInt("style", next);   // survive reboot
   logVerbose("OLED style -> " + String(next));
@@ -550,9 +500,8 @@ static void renderOnce() {
   switch (gDisplayStyle) {
     case 1:  drawRetro(f);       break;
     case 2:  drawBigNumber(f);   break;
-    case 3:  drawStatusCards(f); break;
-    case 4:  drawRadialRing(f);  break;
-    case 5:  drawSplitPanel(f);  break;
+    case 3:  drawRadialRing(f);  break;
+    case 4:  drawSplitPanel(f);  break;
     default: drawBigNumber(f);   break;   // default -> Big Number
   }
 
